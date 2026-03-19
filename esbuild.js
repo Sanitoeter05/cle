@@ -44,6 +44,8 @@ async function main() {
 	});
 	if (watch) {
 		await ctx.watch();
+		// Keep process alive for watch mode
+		process.stdin.resume();
 	} else {
 		await ctx.rebuild();
 		await ctx.dispose();

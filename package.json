@@ -31,7 +31,7 @@
     },
     "commands": [
       {
-        "command": "cle.scanLongFunctions",
+        "command": "cle.scanUsingVSCodeSymbols",
         "title": "Scan for Functions Longer Than 5 Lines",
         "category": "Function Scanner"
       },
@@ -44,13 +44,24 @@
     "menus": {
       "view/title": [
         {
-          "command": "cle.scanLongFunctions",
+          "command": "cle.scanUsingVSCodeSymbols",
           "when": "view == functionScannerView",
           "group": "navigation"
         }
       ]
     }
   },
+  "colors": [
+    {
+      "id": "functionScanner.fileCountForeground",
+      "description": "Color for the function count badge on files",
+      "defaults": {
+        "light": "#ff1493",
+        "dark": "#ff69b4",
+        "highContrast": "#ff00ff"
+      }
+    }
+  ],
   "scripts": {
     "vscode:prepublish": "npm run package",
     "compile": "npm run check-types && npm run lint && node esbuild.js",

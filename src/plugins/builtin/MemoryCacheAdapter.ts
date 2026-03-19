@@ -115,4 +115,12 @@ export class MemoryCacheAdapter implements CacheAdapter {
       timestamp: Date.now(),
     });
   }
+
+  /**
+   * Invalidate cache entry for a specific file.
+   * Called when file is deleted or needs forced refresh.
+   */
+  async invalidate(key: string): Promise<void> {
+    this.cache.delete(key);
+  }
 }

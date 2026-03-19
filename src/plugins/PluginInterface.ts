@@ -12,6 +12,7 @@ export interface FunctionMatch {
   endLine: number;
   lineCount: number;
   metrics: Record<string, unknown>;
+  children?: FunctionMatch[]; // Nested blocks inside this function
 }
 
 /**

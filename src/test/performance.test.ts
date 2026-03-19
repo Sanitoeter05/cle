@@ -220,4 +220,60 @@ suite('Performance Tests', () => {
       `Parallel should be at least 10% faster than sequential`
     );
   });
+
+  test('Incremental scan performance: Scanning only changed files', async () => {
+    // Generate sample files
+    const sampleFiles = generateSampleWorkspace(fileCount, functionsPerFile);
+    for (const [fileName, content] of sampleFiles) {
+      await fs.writeFile(path.join(tempDir, fileName), content);
+    }
+
+    // Create scanner
+    const parser = new TypeScriptParser();
+    const strategy = new LineCountStrategy();
+    const cache = new MemoryCacheAdapter();
+    const engine = new ScannerEngine(parser, strategy, cache);
+
+    // Initialize plugins
+    await parser.initialize({ lineThreshold: 5 });
+    await strategy.initialize({ lineThreshold: 5 });
+    await cache.initialize({ maxCacheEntries: 1000 });
+
+    // First, do a full workspace scan to warm the cache
+    const fullScanStart = Date.now();
+    await engine.scanWorkspace(tempDir, { concurrencyLimit: 8 });
+    const fullScanDuration = Date.now() - fullScanStart;
+
+    // Get the list of all files
+    const allFiles = await fs.readdir(tempDir);
+    const fullFilePaths = allFiles.map(f => path.join(tempDir, f));
+
+    // Simulate a small change: only rescan 5 files
+    const changedFiles = fullFilePaths.slice(0, 5);
+
+    // Measure incremental scan time
+    const incrementalStart = Date.now();
+    const incrementalResults = await engine.scanIncremental(changedFiles);
+    const incrementalDuration = Date.now() - incrementalStart;
+
+    // Verify results
+    assert.ok(incrementalResults.length > 0, 'Should find functions in changed files');
+    assert.ok(
+      incrementalDuration < fullScanDuration * 0.2,
+      `Incremental scan (${incrementalDuration}ms) should be significantly faster than full scan (${fullScanDuration}ms)`
+    );
+
+    // Measure incremental scan for single file (warmest cache scenario)
+    const singleFileStart = Date.now();
+    const singleFileResults = await engine.scanIncremental([changedFiles[0]]);
+    const singleFileDuration = Date.now() - singleFileStart;
+
+    console.log(`\n✓ Incremental Scan Performance Test Result:`);
+    console.log(`  Total files: ${fileCount}`);
+    console.log(`  Full workspace scan: ${fullScanDuration}ms`);
+    console.log(`  Incremental scan (5 files changed): ${incrementalDuration}ms`);
+    console.log(`  Single file scan (from warm cache): ${singleFileDuration}ms`);
+    console.log(`  Speedup (5-file vs full): ${(fullScanDuration / incrementalDuration).toFixed(1)}x`);
+    console.log(`  Functions found in changed files: ${incrementalResults.reduce((sum, r) => sum + r.functions.length, 0)}`);
+  });
 });
