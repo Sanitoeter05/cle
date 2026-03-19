@@ -16,6 +16,7 @@ let treeView: vscode.TreeView<FunctionNode>;
 let scanTimeout: NodeJS.Timeout | undefined;
 
 import { FileWatcher } from './core/FileWatcher';
+import { get } from 'http';
 
 class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> {
 	private _onDidChangeTreeData: vscode.EventEmitter<FunctionNode | undefined | null | void> = new vscode.EventEmitter<FunctionNode | undefined | null | void>();
@@ -32,104 +33,115 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	}
 
 	getTreeItem(element: FunctionNode): vscode.TreeItem {
-		const treeItem = new vscode.TreeItem(
-			element.label,
-			element.collapsibleState
-		);
-
+		const treeItem = this.getNewTreeItem(element);
 		if (element.type === 'file') {
-			treeItem.iconPath = new vscode.ThemeIcon('file');
-			treeItem.resourceUri = vscode.Uri.file(element.filePath);
-			treeItem.contextValue = 'fileWithFunctions';
-			// Add pink-colored description with count
-			if (element.functionCount > 0) {
-				// Use a custom rendering with color styling
-				const countBadge = `●  ${element.functionCount} found`;
-				treeItem.description = countBadge;
-				// Add custom badge rendering
-				const args = encodeURIComponent(JSON.stringify({ filePath: element.filePath }));
-				treeItem.accessibilityInformation = {
-					label: `${element.label} with ${element.functionCount} functions`,
-					role: 'treeitem'
-				};
-			}
+			this.getTreeFile(treeItem, element);
 		} else if (element.type === 'function') {
-			treeItem.iconPath = new vscode.ThemeIcon('symbol-function');
-			treeItem.command = {
-				command: 'cle.openFunction',
-				title: 'Open Function',
-				arguments: [element.filePath, element.startLine]
-			};
+			this.getTreeFunction(treeItem, element);
 		} else if (element.type === 'empty') {
 			treeItem.iconPath = new vscode.ThemeIcon('search');
-		}
-
+		};
 		return treeItem;
+	}
+
+	private getNewTreeItem(element: FunctionNode): vscode.TreeItem {
+		return new vscode.TreeItem(element.label, element.collapsibleState);
+	}
+
+	private getTreeFile(treeItem: vscode.TreeItem, element: FunctionNode): void {
+		treeItem.iconPath = new vscode.ThemeIcon('file');
+		treeItem.resourceUri = vscode.Uri.file(element.filePath);
+		treeItem.contextValue = 'fileWithFunctions';
+	};
+
+	private getTreeFunction(treeItem: vscode.TreeItem, element: FunctionNode): void {
+		treeItem.iconPath = new vscode.ThemeIcon('symbol-function');
+		treeItem.command = {
+			command: 'cle.openFunction',
+			title: 'Open Function',
+			arguments: [element.filePath, element.startLine]
+		};
+	};
+
+	private async filterChildrensForFunction(){
+		// Root level - show files with functions only (filter out empty files)
+		const files: FunctionNode[] = [];
+		const promises = Array.from(this.functionsData).map(([filePath, functions]) =>
+			this.checkFile(functions, filePath, files)
+		);
+		await Promise.all(promises);
+		return files;
+	};
+
+	private async checkFile(functions: FunctionMatch[], filePath: string, files: FunctionNode[]){
+		if (functions.length > 0) {
+			const count = functions.length;
+			files.push(new FunctionNode(
+				path.basename(filePath),
+				vscode.TreeItemCollapsibleState.Collapsed,
+				'file',
+				filePath,
+				0,
+				undefined,
+				count
+			));
+		};
+	};
+
+	private checkFiles(element: FunctionNode){
+		// File level - show top-level functions
+		const functions = this.functionsData.get(element.filePath) || [];
+		const functionNodes = functions.map(fn => {
+			// Determine if this function has children
+			const hasChildren = fn.children && fn.children.length > 0;
+			return new FunctionNode(
+				`${fn.name} (${fn.lineCount} lines)`,
+				hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
+				'function',
+				element.filePath,
+				fn.startLine,
+				fn
+			);
+		});
+		return functionNodes;
+	};
+
+	private checkChildrenFunctions(element: FunctionNode): FunctionNode[] {
+		// Function level - show nested functions (children)
+		if(!element.funcMatch?.children) {
+			return [];
+		}
+		
+		const children = element.funcMatch.children;
+		const childNodes = children.map(child => {
+			const hasChildren = child.children && child.children.length > 0;
+			return new FunctionNode(
+				`${child.name} (${child.lineCount} lines)`,
+				hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
+				'function',
+				element.filePath,
+				child.startLine,
+				child
+			);
+		});
+		return childNodes;
 	}
 
 	getChildren(element?: FunctionNode): Thenable<FunctionNode[]> {
 		if (!element) {
-			// Root level - show files with functions only (filter out empty files)
-			const files: FunctionNode[] = [];
-			this.functionsData.forEach((functions, filePath) => {
-				// Only show files that have functions
-				if (functions.length > 0) {
-					const count = functions.length;
-					files.push(new FunctionNode(
-						path.basename(filePath),
-						vscode.TreeItemCollapsibleState.Collapsed,
-						'file',
-						filePath,
-						0,
-						undefined,
-						count
-					));
+			return (async () => {
+				let files = await this.filterChildrensForFunction();
+				
+				if (files.length === 0) {
+					files.push(new FunctionNode('👉 Run "Scan for Functions Longer Than 5 Lines" to begin', vscode.TreeItemCollapsibleState.None, 'empty', '', 0, undefined));
 				}
-			});
-			
-			// Show empty state message if no data
-			if (files.length === 0) {
-				files.push(new FunctionNode(
-					'👉 Run "Scan for Functions Longer Than 5 Lines" to begin',
-					vscode.TreeItemCollapsibleState.None,
-					'empty',
-					'',
-					0,
-					undefined
-				));
-			}
-			return Promise.resolve(files);
+				
+				return files;
+			})();
 		} else if (element.type === 'file') {
-			// File level - show top-level functions
-			const functions = this.functionsData.get(element.filePath) || [];
-			const functionNodes = functions.map(fn => {
-				// Determine if this function has children
-				const hasChildren = fn.children && fn.children.length > 0;
-				return new FunctionNode(
-					`${fn.name} (${fn.lineCount} lines)`,
-					hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-					'function',
-					element.filePath,
-					fn.startLine,
-					fn
-				);
-			});
-			return Promise.resolve(functionNodes);
+			return Promise.resolve(this.checkFiles(element));
 		} else if (element.type === 'function' && element.funcMatch?.children) {
-			// Function level - show nested functions (children)
-			const children = element.funcMatch.children;
-			const childNodes = children.map(child => {
-				const hasChildren = child.children && child.children.length > 0;
-				return new FunctionNode(
-					`${child.name} (${child.lineCount} lines)`,
-					hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-					'function',
-					element.filePath,
-					child.startLine,
-					child
-				);
-			});
-			return Promise.resolve(childNodes);
+			return Promise.resolve(this.checkChildrenFunctions(element));
 		}
 
 		return Promise.resolve([]);
