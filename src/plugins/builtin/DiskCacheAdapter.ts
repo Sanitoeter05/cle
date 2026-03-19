@@ -48,7 +48,9 @@ export class DiskCacheAdapter implements CacheAdapter {
   }
 
   async get(key: string): Promise<FunctionMatch[] | null> {
-    if (!this.cacheDir) return null;
+    if (!this.cacheDir) {
+      return null;
+    };
 
     const entry = this.cache.get(key);
 
@@ -67,7 +69,9 @@ export class DiskCacheAdapter implements CacheAdapter {
   }
 
   async set(key: string, value: FunctionMatch[]): Promise<void> {
-    if (!this.cacheDir) return;
+    if (!this.cacheDir) {
+      return;
+    }
 
     // LRU: remove oldest entry if at capacity
     if (this.cache.size >= this.maxEntries && !this.cache.has(key)) {
@@ -89,7 +93,9 @@ export class DiskCacheAdapter implements CacheAdapter {
   }
 
   async isValid(key: string, fileHash: string): Promise<boolean> {
-    if (!this.cacheDir) return false;
+    if (!this.cacheDir) {
+      return false;
+    }
 
     const entry = this.cache.get(key);
 
@@ -130,7 +136,9 @@ export class DiskCacheAdapter implements CacheAdapter {
     value: FunctionMatch[],
     fileHash: string
   ): Promise<void> {
-    if (!this.cacheDir) return;
+    if (!this.cacheDir) {
+      return;
+    }
 
     // LRU: remove oldest entry if at capacity
     if (this.cache.size >= this.maxEntries && !this.cache.has(key)) {
@@ -175,7 +183,9 @@ export class DiskCacheAdapter implements CacheAdapter {
    * Write cache entry to disk.
    */
   private async writeCacheFile(key: string, entry: CacheEntry): Promise<void> {
-    if (!this.cacheDir) return;
+    if (!this.cacheDir) {
+      return;
+    }
 
     try {
       const filePath = this.getCacheFilePath(key);
@@ -193,7 +203,9 @@ export class DiskCacheAdapter implements CacheAdapter {
    * Remove cache file from disk.
    */
   private async removeCacheFile(key: string): Promise<void> {
-    if (!this.cacheDir) return;
+    if (!this.cacheDir) {
+      return;
+    }
 
     try {
       const filePath = this.getCacheFilePath(key);
@@ -207,14 +219,17 @@ export class DiskCacheAdapter implements CacheAdapter {
    * Load cache from disk on startup.
    */
   private async loadCacheFromDisk(): Promise<void> {
-    if (!this.cacheDir) return;
+    if (!this.cacheDir) {
+      return;
+    }
 
     try {
       const files = await fs.readdir(this.cacheDir);
 
       for (const file of files) {
-        if (!file.endsWith(".json")) continue;
-
+        if (!file.endsWith(".json")) {
+          continue;
+        }
         try {
           const filePath = path.join(this.cacheDir, file);
           const content = await fs.readFile(filePath, "utf-8");
