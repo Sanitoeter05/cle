@@ -792,19 +792,6 @@ function flattenSymbols(
 
 	processSymbols(symbols);
 
-	const endTime = performance.now();
-	const endMemory = process.memoryUsage().heapUsed;
-	const elapsed = endTime - startTime;
-	const memoryDelta = (endMemory - startMemory) / 1024; // KB
-
-	logger.info(
-		`[flattenSymbols-SYNC] File: ${path.basename(filePath)} | ` +
-		`Processed: ${processedSymbols} symbols | ` +
-		`Created: ${createdFunctions} functions | ` +
-		`Time: ${elapsed.toFixed(2)}ms | ` +
-		`Memory: ${memoryDelta > 0 ? '+' : ''}${memoryDelta.toFixed(2)}KB`
-	);
-
 	return functions;
 }
 
