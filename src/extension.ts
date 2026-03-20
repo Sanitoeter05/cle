@@ -17,6 +17,14 @@ let statusBarItem: vscode.StatusBarItem;
 let treeView: vscode.TreeView<FunctionNode>;
 let scanTimeout: NodeJS.Timeout | undefined;
 
+// Memory cache for symbol scan results - key: filePath, value: FunctionMatch[]
+// Invalidated when file is modified/deleted
+const memoryCache: Map<string, FunctionMatch[]> = new Map();
+
+// Debounce timers for file rescans - key: filePath, value: NodeJS.Timeout
+// Ensures only one rescan per file within 15 seconds
+const rescanTimers: Map<string, NodeJS.Timeout> = new Map();
+
 import { FileWatcher } from './core/FileWatcher';
 import { get } from 'http';
 
@@ -247,17 +255,27 @@ export async function activate(context: vscode.ExtensionContext) {
 			['.ts', '.tsx', '.js', '.jsx']
 		);
 
-		// Subscribe to file change events - trigger full re-scan on native symbols
+		// Subscribe to file change events - trigger incremental rescanning with 15s delay
 		fileWatcherInstance.onFileChange(async (event) => {
-			const changedFiles = [...event.added, ...event.modified];
+			// For modified files - schedule rescan with 15s debounce
+			for (const modifiedFile of event.modified) {
+				scheduleFileScan(modifiedFile);
+			}
 			
-			// For deleted files, update tree immediately
+			// For deleted files - remove from cache and tree immediately
 			for (const deletedFile of event.deleted) {
+				// Clear pending rescan if exists
+				const timer = rescanTimers.get(deletedFile);
+				if (timer) {
+					clearTimeout(timer);
+					rescanTimers.delete(deletedFile);
+				}
+				memoryCache.delete(deletedFile);
 				functionTreeProvider.updateSingleFile(deletedFile, []);
 			}
 			
-			// Schedule re-scan for any file changes
-			if (changedFiles.length > 0) {
+			// For added files - do a full re-scan to integrate new files
+			if (event.added.length > 0) {
 				scheduleScan();
 			}
 		});
@@ -268,12 +286,21 @@ export async function activate(context: vscode.ExtensionContext) {
 	// Keep VSCode's file watcher for compatibility (now acts as fallback)
 	fileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx}');
 	fileWatcher.onDidChange(async (uri) => {
-		scheduleScan();
+		// Incremental rescan with 15s debounce for modified file
+		scheduleFileScan(uri.fsPath);
 	});
 	fileWatcher.onDidCreate(async (uri) => {
+		// New file - full rescan to integrate
 		scheduleScan();
 	});
 	fileWatcher.onDidDelete(async (uri) => {
+		// Remove pending rescan and clear cache/tree
+		const timer = rescanTimers.get(uri.fsPath);
+		if (timer) {
+			clearTimeout(timer);
+			rescanTimers.delete(uri.fsPath);
+		}
+		memoryCache.delete(uri.fsPath);
 		functionTreeProvider.updateSingleFile(uri.fsPath, []);
 		updateStatusBar();
 	});
@@ -303,7 +330,9 @@ async function warmupLanguageServer(workspaceFolder: vscode.WorkspaceFolder): Pr
 			`{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.next/**,**/out/**,**/coverage/**,**/.vscode/**,**/.cache/**,**/tmp/**,**/temp/**,**/.nuxt/**}`
 		);
 
-		if (documents.length === 0) return;
+		if (documents.length === 0) {
+			return;
+		}
 
 		// Sort files alphabetically
 		const sortedDocs = documents.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
@@ -354,9 +383,6 @@ function scheduleScan(): void {
  * Now using multiple parallel batches for performance
  */
 async function runScanUsingNativeSymbols(showPopup: boolean = true) {
-	logger.show();
-	logger.info('Starting scan using VS Code\'s native symbol API with async processing...\n');
-
 	const workspaceFolders = vscode.workspace.workspaceFolders;
 	if (!workspaceFolders) {
 		logger.error('No workspace folder found!');
@@ -388,9 +414,7 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true) {
 		// This ensures the warmup file is processed early
 		const sortedDocuments = documents.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
 		
-		logger.info(
-			`Found ${sortedDocuments.length} source files in ${workspaceFolder.name}\n`
-		);
+
 
 		// Process files in parallel batches to maximize throughput
 		// Each batch processes up to 4 files concurrently
@@ -400,6 +424,16 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true) {
 		// Helper function to process a single file
 		const processSingleFile = async (docUri: vscode.Uri): Promise<{ path: string; functions: FunctionMatch[] | null }> => {
 			try {
+				// Check memory cache first
+				const cached = memoryCache.get(docUri.fsPath);
+				if (cached) {
+					if (performanceLogger) {
+						performanceLogger.logSymbolFetch(docUri.fsPath, 0, cached.length);
+					}
+					return { path: docUri.fsPath, functions: cached };
+				}
+
+				// Cache miss - fetch symbols from VS Code API
 				const symbolFetchStart = performance.now();
 				const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
 					'vscode.executeDocumentSymbolProvider',
@@ -430,7 +464,13 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true) {
 					);
 				}
 
-				return { path: docUri.fsPath, functions: result.functions.length > 0 ? result.functions : null };
+				// Store in memory cache
+				if (result.functions.length > 0) {
+					memoryCache.set(docUri.fsPath, result.functions);
+					return { path: docUri.fsPath, functions: result.functions };
+				}
+
+				return { path: docUri.fsPath, functions: null };
 			} catch (error) {
 				return { path: docUri.fsPath, functions: null };
 			}
@@ -462,21 +502,15 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true) {
 
 		const elapsed = Date.now() - startTime;
 
-		// Log scan completion
+		// Log scan completion to performance logger
 		if (performanceLogger) {
 			performanceLogger.scanComplete(elapsed, documents.length, totalFunctions);
 		}
 
+		logger.show();
 		logger.info(
-			`✓ Scan complete in ${elapsed}ms. Found ${totalFunctions} functions longer than 5 lines.`
+			`✓ Scan complete in ${elapsed}ms. Found ${totalFunctions} functions in ${documents.length} files. | 📊 Log: ${performanceLogger?.getLogFilePath() || 'N/A'}\n`
 		);
-		logger.info(
-			`Processed ${documents.length} files using VS Code's language servers with async/await.\n`
-		);
-
-		if (performanceLogger) {
-			logger.info(`\n📊 Detailed performance log: ${performanceLogger.getLogFilePath()}\n`);
-		}
 
 		if (showPopup) {
 			vscode.window.showInformationMessage(
@@ -495,6 +529,73 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true) {
 				`Function Scanner (Async) failed: ${errorMsg}`
 			);
 		}
+	}
+}
+
+/**
+ * Rescan a single file with 15-second debounce
+ * Prevents excessive rescanning during rapid edits
+ */
+function scheduleFileScan(filePath: string): void {
+	// Clear existing timer for this file
+	const existingTimer = rescanTimers.get(filePath);
+	if (existingTimer) {
+		clearTimeout(existingTimer);
+	}
+
+	// Schedule rescan in 15 seconds
+	const timer = setTimeout(async () => {
+		await rescanSingleFile(filePath);
+		rescanTimers.delete(filePath);
+	}, 15000);
+
+	rescanTimers.set(filePath, timer);
+}
+
+/**
+ * Rescan a single file and update the tree
+ * Called when a file is modified or deleted (incremental scanning)
+ */
+async function rescanSingleFile(filePath: string): Promise<void> {
+	try {
+		// Invalidate cache for this file
+		memoryCache.delete(filePath);
+
+		// If file was deleted or we can't read it, remove from tree
+		if (!require('fs').existsSync(filePath)) {
+			functionTreeProvider.updateSingleFile(filePath, []);
+			updateStatusBar();
+			return;
+		}
+
+		// Rescan just this one file
+		const docUri = vscode.Uri.file(filePath);
+		const symbolFetchStart = performance.now();
+		const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+			'vscode.executeDocumentSymbolProvider',
+			docUri
+		);
+		const symbolFetchDuration = performance.now() - symbolFetchStart;
+
+		if (!symbols || symbols.length === 0) {
+			functionTreeProvider.updateSingleFile(filePath, []);
+			updateStatusBar();
+			return;
+		}
+
+		const result = await flattenSymbolsAsync(symbols, filePath, 5);
+
+		// Cache the result
+		if (result.functions.length > 0) {
+			memoryCache.set(filePath, result.functions);
+			functionTreeProvider.updateSingleFile(filePath, result.functions);
+		} else {
+			functionTreeProvider.updateSingleFile(filePath, []);
+		}
+
+		updateStatusBar();
+	} catch (error) {
+		// Silently fail on rescan errors
 	}
 }
 
