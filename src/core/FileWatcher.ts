@@ -180,15 +180,20 @@ export class FileWatcher {
     /**
      * Default directories to exclude.
      */
-    private defaultExcludeDirs(): Set<string> {
+    public defaultExcludeDirs(): Set<string> {
         return new Set([
-        'node_modules',
-        '.git',
-        '.vscode',
-        'dist',
-        'build',
-        '.idea',
-        'out',
+        "node_modules",
+        ".git",
+        ".vscode",
+        "dist",
+        "build",
+        "coverage",
+        ".next",
+        "out",
+        ".nuxt",
+        ".cache",
+        "tmp",
+        "temp",
         ]);
     }
 }
