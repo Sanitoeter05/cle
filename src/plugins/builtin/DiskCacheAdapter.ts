@@ -222,7 +222,6 @@ export class DiskCacheAdapter implements CacheAdapter {
     if (!this.cacheDir) {
       return;
     }
-
     try {
       const files = await fs.readdir(this.cacheDir);
 
