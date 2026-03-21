@@ -342,6 +342,10 @@ export async function activate(context: vscode.ExtensionContext) {
 			if (documents && documents.length > 0) {
 				// Pre-warm the language server with discovered files
 				await warmupLanguageServer(documents);
+				// Critical: Wait 300ms for VS Code's LS to fully initialize
+				// Without this, first batch hits uninitialized LS, returns 0 symbols, takes 250+ms each
+				// With this, LS is ready for parallel batch processing
+				await new Promise(resolve => setTimeout(resolve, 300));
 				// Initial scan on startup (non-blocking, LS is already warm, files already discovered)
 				runScanUsingNativeSymbols(false, documents);
 			} else {
@@ -369,38 +373,46 @@ async function getAllFiles(workspaceFolder: vscode.WorkspaceFolder): Promise<vsc
 
 const testFilePatterns =[/test/i, /spec/i, /mock/i];
 
-function findWarmupFile(sortedDocs: vscode.Uri[]): vscode.Uri | null {
-	let warmupFile: vscode.Uri | null = null;
-	for (const doc of sortedDocs) {
-		const filename = doc.fsPath.toLowerCase();
-		const isTestFile = testFilePatterns.some(pattern => pattern.test(filename));
-		if (!isTestFile) {
-			warmupFile = doc;
-			break;
-		}
-	}
-	return warmupFile;
-}
-
 /**
- * Pre-warm the language server by fetching symbols from one file
+ * Pre-warm the language server by fetching symbols from multiple files
  * This initializes the JS language server before the parallel batch scan begins
+ * Warmup with 2-3 files ensures LS is fully ready for parallel batch processing
  * @param documents - Pre-discovered list of source files (avoids duplicate discovery)
  */
 async function warmupLanguageServer(documents: vscode.Uri[]): Promise<void> {
 	try {
 		const sortedDocs = documents.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
-		const warmupFile = findWarmupFile(sortedDocs);
-		if (warmupFile) {
-			// Single warmup call - initializes the JS language server
-			await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-				'vscode.executeDocumentSymbolProvider',
-				warmupFile
-			);
+		const warmupFiles = findWarmupFiles(sortedDocs, 3);  // Warmup with up to 3 files
+		if (warmupFiles.length > 0) {
+			// Warmup in sequence (not parallel) - ensures LS gets properly initialized
+			for (const warmupFile of warmupFiles) {
+				await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+					'vscode.executeDocumentSymbolProvider',
+					warmupFile
+				);
+			}
 		}
 	} catch (error) {
 		// Silently ignore warmup errors
 	}
+}
+
+/**
+ * Find first N non-test files for warmup
+ */
+function findWarmupFiles(sortedDocs: vscode.Uri[], count: number): vscode.Uri[] {
+	const warmupFiles: vscode.Uri[] = [];
+	for (const doc of sortedDocs) {
+		const filename = doc.fsPath.toLowerCase();
+		const isTestFile = testFilePatterns.some(pattern => pattern.test(filename));
+		if (!isTestFile) {
+			warmupFiles.push(doc);
+			if (warmupFiles.length >= count) {
+				break;
+			}
+		}
+	}
+	return warmupFiles;
 }
 
 /**
