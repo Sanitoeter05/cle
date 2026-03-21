@@ -53,6 +53,28 @@ const memoryCache: Map<string, CacheEntry> = new Map();
 // Ensures only one rescan per file within 15 seconds
 const rescanTimers: Map<string, NodeJS.Timeout> = new Map();
 
+/**
+ * Invalidate the cache entry for a specific file
+ * Used consistently across all cache invalidation points
+ * @param filePath - The file path to invalidate cache for
+ */
+function invalidateFileCache(filePath: string): void {
+	memoryCache.delete(filePath);
+}
+
+/**
+ * Convert an unknown error type to a standardized Error instance
+ * Handles both Error objects and other types (strings, null, undefined, etc.)
+ * Does NOT sanitize - Logger handles that internally via sanitizeError()
+ * @param error - The error to convert
+ * @returns An Error instance
+ */
+function toError(error: unknown): Error {
+	if (error instanceof Error) {
+		return error;
+	}
+	return new Error(String(error));
+}
 
 
 class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> {
@@ -374,7 +396,7 @@ function removeRescan(uri: vscode.Uri){
 		clearTimeout(timer);
 		rescanTimers.delete(uri.fsPath);
 	}
-	memoryCache.delete(uri.fsPath);
+	invalidateFileCache(uri.fsPath);
 };
 
 // This method is called when your extension is activated
@@ -479,7 +501,7 @@ function validateFilePath(filePath: string, workspaceFolder: vscode.Uri): boolea
 		
 		return true;
 	} catch (error) {
-		logger.error(`Error validating path: ${filePath}`, error instanceof Error ? error : new Error(String(error)));
+		logger.error(`Error validating path: ${filePath}`, toError(error));
 		return false;
 	}
 }
@@ -557,10 +579,10 @@ async function processSingleFile(docUri: vscode.Uri): Promise<{ path: string; fu
 					return { path: docUri.fsPath, functions: cached.data };
 				}
 				// File was modified, invalidate cache
-				memoryCache.delete(docUri.fsPath);
+				invalidateFileCache(docUri.fsPath);
 			} catch (err) {
 				// If we can't stat the file, invalidate cache
-				memoryCache.delete(docUri.fsPath);
+			invalidateFileCache(docUri.fsPath);
 			}
 		}
 
@@ -702,27 +724,28 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true, preDiscovere
 		updateStatusBar();
 
 		const elapsed = Date.now() - startTime;
+		const actualTotalFunctions = functionTreeProvider.getTotalCount(); // Use tree as source of truth
 
 		// Log scan completion to performance logger
 		if (performanceLogger) {
-			performanceLogger.scanComplete(elapsed, documents.length, totalFunctions);
+			performanceLogger.scanComplete(elapsed, documents.length, actualTotalFunctions);
 		}
 
 		logger.show();
 		logger.info(
-			`✓ Scan complete in ${elapsed}ms. Found ${totalFunctions} functions in ${documents.length} files. | 📊 Log: ${performanceLogger?.getLogFilePath() || 'N/A'}\n`
+			`✓ Scan complete in ${elapsed}ms. Found ${actualTotalFunctions} functions in ${documents.length} files. | 📊 Log: ${performanceLogger?.getLogFilePath() || 'N/A'}\n`
 		);
 
 		if (showPopup) {
 			vscode.window.showInformationMessage(
-				`Function Scanner (Async): Found ${totalFunctions} functions longer than 5 lines in ${elapsed}ms.`
+				`Function Scanner (Async): Found ${actualTotalFunctions} functions longer than 5 lines in ${elapsed}ms.`
 			);
 		}
 	} catch (error) {
 		const errorMsg = sanitizeErrorForUI(error);
 		logger.error(
 			'Async scan failed',
-			error instanceof Error ? error : new Error(errorMsg)
+			toError(error)
 		);
 		if (showPopup) {
 			vscode.window.showErrorMessage(
@@ -766,7 +789,7 @@ async function rescanSingleFile(filePath: string): Promise<void> {
 		}
 
 		// Invalidate cache for this file
-		memoryCache.delete(filePath);
+		invalidateFileCache(filePath);
 
 		// If file was deleted or we can't read it, remove from tree
 		if (!existsSync(filePath)) {
@@ -925,7 +948,7 @@ async function flattenSymbolsAsync(
 	} catch (error) {
 		logger.error(
 			`Async processing failed for ${basename(filePath)}`,
-			error instanceof Error ? error : new Error(sanitizeErrorForUI(error))
+			toError(error)
 		);
 		return {
 			functions: [],
