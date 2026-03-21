@@ -427,6 +427,30 @@ async function getAllFiles(workspaceFolder: vscode.WorkspaceFolder): Promise<vsc
 	};
 };
 
+/**
+ * Sanitize error messages to prevent leaking sensitive information in UI
+ * @param error - The error to sanitize
+ * @returns Safe error message for display to users
+ */
+function sanitizeErrorForUI(error: unknown): string {
+	let message = error instanceof Error ? error.message : String(error);
+	
+	// Limit message length
+	if (message.length > 200) {
+		message = message.slice(0, 200) + '...';
+	}
+	
+	// Redact file paths
+	message = message.replace(/\/home\/[\w\-]+/g, '~');
+	message = message.replace(/[A-Z]:\\Users\\[\w\-]+/g, '~');
+	
+	// Redact credentials
+	message = message.replace(/token['"\':\s=]+[^\s'"\']+/gi, 'token=[REDACTED]');
+	message = message.replace(/password['"\':\s=]+[^\s'"\']+/gi, 'password=[REDACTED]');
+	
+	return message;
+}
+
 const testFilePatterns =[/test/i, /spec/i, /mock/i];
 
 /**
@@ -480,7 +504,10 @@ async function warmupLanguageServer(documents: vscode.Uri[]): Promise<void> {
 			}
 		}
 	} catch (error) {
-		// Silently ignore warmup errors
+		logger.warn(
+			`Language server warmup encountered an error: ${error instanceof Error ? error.message : String(error)}`
+		);
+		// Continue execution - warmup failure is not critical
 	}
 }
 
@@ -692,8 +719,7 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true, preDiscovere
 			);
 		}
 	} catch (error) {
-		const errorMsg =
-			error instanceof Error ? error.message : String(error);
+		const errorMsg = sanitizeErrorForUI(error);
 		logger.error(
 			'Async scan failed',
 			error instanceof Error ? error : new Error(errorMsg)
@@ -784,7 +810,10 @@ async function rescanSingleFile(filePath: string): Promise<void> {
 
 		updateStatusBar();
 	} catch (error) {
-		// Silently fail on rescan errors
+		logger.warn(
+			`Rescan failed for file ${filePath}: ${error instanceof Error ? error.message : String(error)}`
+		);
+		// Continue execution - rescan failure is non-critical for already-cached data
 	}
 }
 
@@ -896,7 +925,7 @@ async function flattenSymbolsAsync(
 	} catch (error) {
 		logger.error(
 			`Async processing failed for ${basename(filePath)}`,
-			error instanceof Error ? error : new Error(String(error))
+			error instanceof Error ? error : new Error(sanitizeErrorForUI(error))
 		);
 		return {
 			functions: [],

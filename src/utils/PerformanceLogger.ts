@@ -25,12 +25,37 @@ export class PerformanceLogger {
 	private sessionId: string;
 
 	constructor(workspaceFolder: vscode.Uri) {
-		this.sessionId = new Date().toISOString().replace(/[:.]/g, '-');
+		// Validate workspace folder exists
+		if (!fs.existsSync(workspaceFolder.fsPath)) {
+			throw new Error(`Invalid workspace folder: ${workspaceFolder.fsPath}`);
+		}
+
+		// Safe session ID generation without problematic characters
+		const now = new Date();
+		const year = now.getFullYear();
+		const month = String(now.getMonth() + 1).padStart(2, '0');
+		const day = String(now.getDate()).padStart(2, '0');
+		const hours = String(now.getHours()).padStart(2, '0');
+		const minutes = String(now.getMinutes()).padStart(2, '0');
+		const seconds = String(now.getSeconds()).padStart(2, '0');
+		const ms = String(now.getMilliseconds()).padStart(3, '0');
+		const uniqueId = Math.random().toString(36).substring(2, 9);
+		this.sessionId = `${year}-${month}-${day}T${hours}-${minutes}-${seconds}-${ms}Z-${uniqueId}`;
+
 		const logsDir = path.join(workspaceFolder.fsPath, '.cle-logs');
 		
-		// Create logs directory if it doesn't exist
-		if (!fs.existsSync(logsDir)) {
-			fs.mkdirSync(logsDir, { recursive: true });
+		// Create logs directory with proper error handling
+		try {
+			if (!fs.existsSync(logsDir)) {
+				fs.mkdirSync(logsDir, { recursive: true, mode: 0o755 });
+			}
+			
+			// Test write permissions by attempting to create and delete a test file
+			const testFile = path.join(logsDir, '.write-test');
+			fs.writeFileSync(testFile, '');
+			fs.unlinkSync(testFile);
+		} catch (error) {
+			throw new Error(`Cannot create or write to logs directory: ${logsDir}`);
 		}
 		
 		this.logFilePath = path.join(logsDir, `performance-${this.sessionId}.log`);
