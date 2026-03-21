@@ -4,10 +4,28 @@
  */
 
 import * as vscode from 'vscode';
-import {basename, } from 'path';
+import { basename, normalize } from 'path';
 import { Logger } from './utils/Logger';
 import { PerformanceLogger } from './utils/PerformanceLogger';
-import {existsSync, statSync}	from 'fs';
+import { existsSync, statSync } from 'fs';
+
+/**
+ * Configuration constants for the Function Scanner extension
+ * Centralized settings for performance tuning and behavior control
+ */
+const CONFIG = {
+	// File processing configuration
+	SYMBOL_FETCH_BATCH_SIZE: 4,           // Files processed in parallel (optimal for most systems)
+	SYMBOL_PROCESSING_BATCH_SIZE: 10,     // Symbols processed per batch before yielding to event loop
+	FUNCTION_LINE_THRESHOLD: 5,           // Minimum number of lines to be considered "long"
+
+	// Timing configuration (in milliseconds)
+	FILE_RESCAN_DEBOUNCE_MS: 15000,      // Debounce rapid file changes to prevent excessive rescans
+	LANGUAGE_SERVER_WARMUP_DELAY_MS: 300, // Time for VS Code's language server to fully initialize
+
+	// Warmup configuration
+	MAX_WARMUP_FILES: 3,                  // Number of files to use for language server warmup
+};
 
 let functionTreeProvider: FunctionTreeDataProvider;
 let logger: Logger;
@@ -19,7 +37,7 @@ let scanTimeout: NodeJS.Timeout | undefined;
 
 /**
  * Cache entry structure: stores both scan results and file modification time
- * Allows validation of cache freshness
+ * Allows validation of cache freshness alongside file watcher invalidation
  */
 interface CacheEntry {
 	data: FunctionMatch[];
@@ -28,6 +46,7 @@ interface CacheEntry {
 
 // Memory cache for symbol scan results - key: filePath, value: CacheEntry
 // Invalidated when file is modified/deleted or modification time changes
+// File watcher provides additional safety for cache invalidation
 const memoryCache: Map<string, CacheEntry> = new Map();
 
 // Debounce timers for file rescans - key: filePath, value: NodeJS.Timeout
@@ -53,10 +72,10 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	getTreeItem(element: FunctionNode): vscode.TreeItem {
 		const treeItem = this.getNewTreeItem(element);
 		
-		return this.getTreeItemfilter(element, treeItem);
+		return this.applyTreeItemFilters(element, treeItem);
 	};
 
-	private getTreeItemfilter(element: FunctionNode, treeItem: vscode.TreeItem): vscode.TreeItem {
+	private applyTreeItemFilters(element: FunctionNode, treeItem: vscode.TreeItem): vscode.TreeItem {
 		if (element.type === 'file') {
 			this.getTreeFile(treeItem, element);
 		} else if (element.type === 'function') {
@@ -167,6 +186,7 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	/**
 	 * Compare two Maps of function matches for equality
 	 * Returns true if maps have identical content (deep comparison)
+	 * Uses property-based comparison instead of JSON.stringify for performance
 	 */
 	private mapsEqual(map1: Map<string, FunctionMatch[]>, map2: Map<string, FunctionMatch[]>): boolean {
 		if (map1.size !== map2.size) {
@@ -175,17 +195,53 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 		
 		for (const [key, value1] of map1) {
 			const value2 = map2.get(key);
-			if (!value2) {
-				return false;
-			}
-			
-			// Deep compare arrays using JSON stringification
-			if (JSON.stringify(value1) !== JSON.stringify(value2)) {
+			if (!value2 || !this.arraysEqual(value1, value2)) {
 				return false;
 			}
 		}
 		
 		return true;
+	}
+
+	/**
+	 * Compare two arrays of FunctionMatch objects for equality
+	 * Returns true if arrays have same length and all elements are equal
+	 */
+	private arraysEqual(arr1: FunctionMatch[], arr2: FunctionMatch[]): boolean {
+		if (arr1.length !== arr2.length) {
+			return false;
+		}
+		
+		for (let i = 0; i < arr1.length; i++) {
+			if (!this.functionMatchEqual(arr1[i], arr2[i])) {
+				return false;
+			}
+		}
+		
+		return true;
+	}
+
+	/**
+	 * Compare two FunctionMatch objects for equality
+	 * Performs recursive comparison of children arrays
+	 */
+	private functionMatchEqual(fn1: FunctionMatch, fn2: FunctionMatch): boolean {
+		// Compare basic properties
+		if (fn1.name !== fn2.name ||
+			fn1.startLine !== fn2.startLine ||
+			fn1.endLine !== fn2.endLine ||
+			fn1.lineCount !== fn2.lineCount) {
+			return false;
+		}
+
+		// Compare children arrays
+		if (!fn1.children && !fn2.children) {
+			return true; // Both have no children
+		}
+		if (!fn1.children || !fn2.children) {
+			return false; // One has children, the other doesn't
+		}
+		return this.arraysEqual(fn1.children, fn2.children);
 	}
 
 	updateData(fileMap: Map<string, FunctionMatch[]>) {
@@ -210,7 +266,7 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 		
 		if (functions.length > 0) {
 			// Check if new data differs from old data
-			if (!oldFunctions || JSON.stringify(oldFunctions) !== JSON.stringify(functions)) {
+			if (!oldFunctions || !this.arraysEqual(oldFunctions, functions)) {
 				this.functionsData.set(filePath, functions);
 				hasChanged = true;
 			}
@@ -342,10 +398,10 @@ export async function activate(context: vscode.ExtensionContext) {
 			if (documents && documents.length > 0) {
 				// Pre-warm the language server with discovered files
 				await warmupLanguageServer(documents);
-				// Critical: Wait 300ms for VS Code's LS to fully initialize
+				// Critical: Wait for VS Code's LS to fully initialize
 				// Without this, first batch hits uninitialized LS, returns 0 symbols, takes 250+ms each
 				// With this, LS is ready for parallel batch processing
-				await new Promise(resolve => setTimeout(resolve, 300));
+				await new Promise(resolve => setTimeout(resolve, CONFIG.LANGUAGE_SERVER_WARMUP_DELAY_MS));
 				// Initial scan on startup (non-blocking, LS is already warm, files already discovered)
 				runScanUsingNativeSymbols(false, documents);
 			} else {
@@ -374,6 +430,37 @@ async function getAllFiles(workspaceFolder: vscode.WorkspaceFolder): Promise<vsc
 const testFilePatterns =[/test/i, /spec/i, /mock/i];
 
 /**
+ * Validate that a file path is within the workspace boundaries
+ * Prevents path traversal and symlink attacks
+ * @param filePath - The file path to validate
+ * @param workspaceFolder - The workspace folder URI
+ * @returns true if path is safe and within workspace, false otherwise
+ */
+function validateFilePath(filePath: string, workspaceFolder: vscode.Uri): boolean {
+	try {
+		const normalizedPath = normalize(filePath);
+		const workspacePath = normalize(workspaceFolder.fsPath);
+		
+		// Ensure file is within workspace
+		if (!normalizedPath.startsWith(workspacePath)) {
+			logger.warn(`Path outside workspace: ${filePath}`);
+			return false;
+		}
+		
+		// Reject paths with suspicious patterns
+		if (normalizedPath.includes('..') || normalizedPath.includes('.git')) {
+			logger.warn(`Suspicious path detected: ${filePath}`);
+			return false;
+		}
+		
+		return true;
+	} catch (error) {
+		logger.error(`Error validating path: ${filePath}`, error instanceof Error ? error : new Error(String(error)));
+		return false;
+	}
+}
+
+/**
  * Pre-warm the language server by fetching symbols from multiple files
  * This initializes the JS language server before the parallel batch scan begins
  * Warmup with 2-3 files ensures LS is fully ready for parallel batch processing
@@ -382,7 +469,7 @@ const testFilePatterns =[/test/i, /spec/i, /mock/i];
 async function warmupLanguageServer(documents: vscode.Uri[]): Promise<void> {
 	try {
 		const sortedDocs = documents.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
-		const warmupFiles = findWarmupFiles(sortedDocs, 3);  // Warmup with up to 3 files
+		const warmupFiles = findWarmupFiles(sortedDocs, CONFIG.MAX_WARMUP_FILES);
 		if (warmupFiles.length > 0) {
 			// Warmup in sequence (not parallel) - ensures LS gets properly initialized
 			for (const warmupFile of warmupFiles) {
@@ -416,6 +503,93 @@ function findWarmupFiles(sortedDocs: vscode.Uri[], count: number): vscode.Uri[] 
 }
 
 /**
+ * Process a single file to extract function symbols
+ * Handles caching, symbol fetching, and flattening with error recovery
+ * @param docUri - URI of the file to process
+ * @returns Object with file path and extracted functions (or null on error)
+ */
+async function processSingleFile(docUri: vscode.Uri): Promise<{ path: string; functions: FunctionMatch[] | null }> {
+	try {
+		// Validate file path for security
+		const workspaceFolders = vscode.workspace.workspaceFolders;
+		if (!workspaceFolders || !validateFilePath(docUri.fsPath, workspaceFolders[0].uri)) {
+			logger.error(`Invalid or unsafe file path: ${docUri.fsPath}`);
+			return { path: docUri.fsPath, functions: null };
+		}
+
+		// Check memory cache first - validate against file modification time
+		const cached = memoryCache.get(docUri.fsPath);
+		if (cached) {
+			try {
+				const stats = statSync(docUri.fsPath);
+				// Use cache only if file hasn't been modified since we cached it
+				if (stats.mtimeMs === cached.modTime) {
+					if (performanceLogger) {
+						performanceLogger.logSymbolFetch(docUri.fsPath, 0, cached.data.length);
+					}
+					return { path: docUri.fsPath, functions: cached.data };
+				}
+				// File was modified, invalidate cache
+				memoryCache.delete(docUri.fsPath);
+			} catch (err) {
+				// If we can't stat the file, invalidate cache
+				memoryCache.delete(docUri.fsPath);
+			}
+		}
+
+		// Cache miss or invalidated - fetch symbols from VS Code API
+		const symbolFetchStart = performance.now();
+		const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+			'vscode.executeDocumentSymbolProvider',
+			docUri
+		);
+		const symbolFetchDuration = performance.now() - symbolFetchStart;
+
+		if (!symbols || symbols.length === 0) {
+			if (performanceLogger) {
+				performanceLogger.logSymbolFetch(docUri.fsPath, symbolFetchDuration, 0);
+			}
+			return { path: docUri.fsPath, functions: null };
+		}
+
+		if (performanceLogger) {
+			performanceLogger.logSymbolFetch(docUri.fsPath, symbolFetchDuration, symbols.length);
+		}
+
+		const result = await flattenSymbolsAsync(symbols, docUri.fsPath);
+
+		if (performanceLogger && result.stats) {
+			performanceLogger.logAsyncProcess(
+				docUri.fsPath,
+				result.elapsed,
+				result.stats.processedSymbols,
+				result.stats.createdFunctions,
+				result.stats.memory
+			);
+		}
+
+		// Store in memory cache with modification time
+		if (result.functions.length > 0) {
+			try {
+				const stats = statSync(docUri.fsPath);
+				memoryCache.set(docUri.fsPath, {
+					data: result.functions,
+					modTime: stats.mtimeMs
+				});
+			} catch (err) {
+				// If we can't stat the file, store without modTime tracking
+				// (file may have been deleted or is inaccessible)
+			}
+			return { path: docUri.fsPath, functions: result.functions };
+		}
+
+		return { path: docUri.fsPath, functions: null };
+	} catch (error) {
+		return { path: docUri.fsPath, functions: null };
+	}
+}
+
+/**
  * Scan using VS Code's native symbol API (more accurate than custom parser)
  * Now using multiple parallel batches for performance
  * @param showPopup - Whether to show completion message
@@ -438,6 +612,7 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true, preDiscovere
 		const startTime = Date.now();
 		const fileMap = new Map<string, FunctionMatch[]>();
 		let totalFunctions = 0;
+		const failedFiles: string[] = [];
 
 		const workspaceFolder = workspaceFolders[0];
 
@@ -462,84 +637,9 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true, preDiscovere
 
 
 		// Process files in parallel batches to maximize throughput
-		// Each batch processes up to 4 files concurrently
-		// (Language servers serialize internally, 4 is optimal balance)
-		const BATCH_SIZE = 4;
-		
-		// Helper function to process a single file
-		const processSingleFile = async (docUri: vscode.Uri): Promise<{ path: string; functions: FunctionMatch[] | null }> => {
-			try {
-				// Check memory cache first - validate against file modification time
-				const cached = memoryCache.get(docUri.fsPath);
-				if (cached) {
-					try {
-						const stats = statSync(docUri.fsPath);
-						// Use cache only if file hasn't been modified since we cached it
-						if (stats.mtimeMs === cached.modTime) {
-							if (performanceLogger) {
-								performanceLogger.logSymbolFetch(docUri.fsPath, 0, cached.data.length);
-							}
-							return { path: docUri.fsPath, functions: cached.data };
-						}
-						// File was modified, invalidate cache
-						memoryCache.delete(docUri.fsPath);
-					} catch (err) {
-						// If we can't stat the file, invalidate cache
-						memoryCache.delete(docUri.fsPath);
-					}
-				}
-
-				// Cache miss or invalidated - fetch symbols from VS Code API
-				const symbolFetchStart = performance.now();
-				const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-					'vscode.executeDocumentSymbolProvider',
-					docUri
-				);
-				const symbolFetchDuration = performance.now() - symbolFetchStart;
-
-				if (!symbols || symbols.length === 0) {
-					if (performanceLogger) {
-						performanceLogger.logSymbolFetch(docUri.fsPath, symbolFetchDuration, 0);
-					}
-					return { path: docUri.fsPath, functions: null };
-				}
-
-				if (performanceLogger) {
-					performanceLogger.logSymbolFetch(docUri.fsPath, symbolFetchDuration, symbols.length);
-				}
-
-				const result = await flattenSymbolsAsync(symbols, docUri.fsPath, 5);
-
-				if (performanceLogger && result.stats) {
-					performanceLogger.logAsyncProcess(
-						docUri.fsPath,
-						result.elapsed,
-						result.stats.processedSymbols,
-						result.stats.createdFunctions,
-						result.stats.memory
-					);
-				}
-
-				// Store in memory cache with modification time
-				if (result.functions.length > 0) {
-					try {
-						const stats = statSync(docUri.fsPath);
-						memoryCache.set(docUri.fsPath, {
-							data: result.functions,
-							modTime: stats.mtimeMs
-						});
-					} catch (err) {
-						// If we can't stat the file, store without modTime tracking
-						// (file may have been deleted or is inaccessible)
-					}
-					return { path: docUri.fsPath, functions: result.functions };
-				}
-
-				return { path: docUri.fsPath, functions: null };
-			} catch (error) {
-				return { path: docUri.fsPath, functions: null };
-			}
-		};
+		// Each batch processes up to SYMBOL_FETCH_BATCH_SIZE files concurrently
+		// (Language servers serialize internally, this is optimal balance)
+		const BATCH_SIZE = CONFIG.SYMBOL_FETCH_BATCH_SIZE;
 
 		// Process all files in parallel batches
 		for (let i = 0; i < sortedDocuments.length; i += BATCH_SIZE) {
@@ -550,8 +650,17 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true, preDiscovere
 				if (result.status === 'fulfilled' && result.value.functions) {
 					fileMap.set(result.value.path, result.value.functions);
 					totalFunctions += result.value.functions.length;
+				} else if (result.status === 'rejected') {
+					const failedPath = result.reason?.path || 'Unknown';
+					failedFiles.push(failedPath);
+					logger.warn(`Failed to scan file: ${failedPath} - ${result.reason?.message || result.reason}`);
 				}
 			}
+		}
+
+		// Log summary of any failures
+		if (failedFiles.length > 0) {
+			logger.warn(`${failedFiles.length} file(s) failed to scan: ${failedFiles.join(', ')}`);
 		}
 
 		// Measure tree update time
@@ -608,11 +717,11 @@ function scheduleFileScan(filePath: string): void {
 		clearTimeout(existingTimer);
 	}
 
-	// Schedule rescan in 15 seconds
+	// Schedule rescan with debounce delay
 	const timer = setTimeout(async () => {
 		await rescanSingleFile(filePath);
 		rescanTimers.delete(filePath);
-	}, 15000);
+	}, CONFIG.FILE_RESCAN_DEBOUNCE_MS);
 
 	rescanTimers.set(filePath, timer);
 }
@@ -623,6 +732,13 @@ function scheduleFileScan(filePath: string): void {
  */
 async function rescanSingleFile(filePath: string): Promise<void> {
 	try {
+		// Validate file path for security
+		const workspaceFolders = vscode.workspace.workspaceFolders;
+		if (!workspaceFolders || !validateFilePath(filePath, workspaceFolders[0].uri)) {
+			logger.error(`Invalid or unsafe file path: ${filePath}`);
+			return;
+		}
+
 		// Invalidate cache for this file
 		memoryCache.delete(filePath);
 
@@ -648,7 +764,7 @@ async function rescanSingleFile(filePath: string): Promise<void> {
 			return;
 		}
 
-		const result = await flattenSymbolsAsync(symbols, filePath, 5);
+		const result = await flattenSymbolsAsync(symbols, filePath);
 
 		// Cache the result with modification time
 		if (result.functions.length > 0) {
@@ -685,13 +801,13 @@ const FUNCTION_LIKE_KINDS = new Set([
 async function flattenSymbolsAsync(
 	symbols: vscode.DocumentSymbol[],
 	filePath: string,
-	threshold: number
+	threshold: number = CONFIG.FUNCTION_LINE_THRESHOLD
 ): Promise<{ functions: FunctionMatch[]; elapsed: number; stats: any }> {
 	const overallStart = performance.now();
 	const startMemory = process.memoryUsage().heapUsed;
 	let processedSymbols = 0;
 	let createdFunctions = 0;
-	const BATCH_SIZE = 10; // Process 10 symbols per batch, then yield
+	const BATCH_SIZE = CONFIG.SYMBOL_PROCESSING_BATCH_SIZE; // Process symbols per batch, then yield
 
 	const functions: FunctionMatch[] = [];
 
@@ -797,14 +913,14 @@ async function flattenSymbolsAsync(
 
 function updateStatusBar(): void {
 	const total = functionTreeProvider.getTotalCount();
-	setStatusBar(total, '#FF1493', `$(symbol-function) ${total} Functions > 5L`, `Found ${total} functions longer than 5 lines. Click to rescan.`);
+	setStatusBarEntry('#FF1493', `$(symbol-function) ${total} Functions > 5L`, `Found ${total} functions longer than 5 lines. Click to rescan.`);
 	setBadge(total);	
 }
 
-function setStatusBar(total:number, color: string, text: string, tooltip: string) {
-	statusBarItem.text = `$(symbol-function) ${total} Functions > 5L`;
-	statusBarItem.color = '#FF1493'; // Deep pink
-	statusBarItem.tooltip = `Found ${total} functions longer than 5 lines. Click to rescan.`;
+function setStatusBarEntry( color: string, text: string, tooltip: string) {
+	statusBarItem.text = text;
+	statusBarItem.color = color;
+	statusBarItem.tooltip = tooltip;
 };
 
 function setBadge(total:number){
