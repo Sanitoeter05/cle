@@ -4,29 +4,37 @@
  */
 
 import * as vscode from 'vscode';
-import * as path from 'path';
+import {basename, } from 'path';
 import { Logger } from './utils/Logger';
 import { PerformanceLogger } from './utils/PerformanceLogger';
+import {existsSync, statSync}	from 'fs';
 
 let functionTreeProvider: FunctionTreeDataProvider;
 let logger: Logger;
 let performanceLogger: PerformanceLogger | undefined;
 let fileWatcher: vscode.FileSystemWatcher;
-let fileWatcherInstance: FileWatcher | undefined;
 let statusBarItem: vscode.StatusBarItem;
 let treeView: vscode.TreeView<FunctionNode>;
 let scanTimeout: NodeJS.Timeout | undefined;
 
-// Memory cache for symbol scan results - key: filePath, value: FunctionMatch[]
-// Invalidated when file is modified/deleted
-const memoryCache: Map<string, FunctionMatch[]> = new Map();
+/**
+ * Cache entry structure: stores both scan results and file modification time
+ * Allows validation of cache freshness
+ */
+interface CacheEntry {
+	data: FunctionMatch[];
+	modTime: number;
+}
+
+// Memory cache for symbol scan results - key: filePath, value: CacheEntry
+// Invalidated when file is modified/deleted or modification time changes
+const memoryCache: Map<string, CacheEntry> = new Map();
 
 // Debounce timers for file rescans - key: filePath, value: NodeJS.Timeout
 // Ensures only one rescan per file within 15 seconds
 const rescanTimers: Map<string, NodeJS.Timeout> = new Map();
 
-import { FileWatcher } from './core/FileWatcher';
-import { get } from 'http';
+
 
 class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> {
 	private _onDidChangeTreeData: vscode.EventEmitter<FunctionNode | undefined | null | void> = new vscode.EventEmitter<FunctionNode | undefined | null | void>();
@@ -40,10 +48,15 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 			total += functions.length;
 		});
 		return total;
-	}
+	};
 
 	getTreeItem(element: FunctionNode): vscode.TreeItem {
 		const treeItem = this.getNewTreeItem(element);
+		
+		return this.getTreeItemfilter(element, treeItem);
+	};
+
+	private getTreeItemfilter(element: FunctionNode, treeItem: vscode.TreeItem): vscode.TreeItem {
 		if (element.type === 'file') {
 			this.getTreeFile(treeItem, element);
 		} else if (element.type === 'function') {
@@ -52,7 +65,7 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 			treeItem.iconPath = new vscode.ThemeIcon('search');
 		};
 		return treeItem;
-	}
+	};
 
 	private getNewTreeItem(element: FunctionNode): vscode.TreeItem {
 		return new vscode.TreeItem(element.label, element.collapsibleState);
@@ -74,7 +87,6 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	};
 
 	private async filterChildrensForFunction(){
-		// Root level - show files with functions only (filter out empty files)
 		const files: FunctionNode[] = [];
 		const promises = Array.from(this.functionsData).map(([filePath, functions]) =>
 			this.checkFile(functions, filePath, files)
@@ -87,7 +99,7 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 		if (functions.length > 0) {
 			const count = functions.length;
 			files.push(new FunctionNode(
-				path.basename(filePath),
+				basename(filePath),
 				vscode.TreeItemCollapsibleState.Collapsed,
 				'file',
 				filePath,
@@ -103,17 +115,21 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 		const functions = this.functionsData.get(element.filePath) || [];
 		const functionNodes = functions.map(fn => {
 			// Determine if this function has children
-			const hasChildren = fn.children && fn.children.length > 0;
-			return new FunctionNode(
-				`${fn.name} (${fn.lineCount} lines)`,
-				hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-				'function',
-				element.filePath,
-				fn.startLine,
-				fn
-			);
+			return this.functionHasChildren(fn, element);
 		});
 		return functionNodes;
+	};
+
+	private functionHasChildren(fn:FunctionMatch, element: FunctionNode): FunctionNode {
+		const hasChildren = fn.children && fn.children.length > 0;
+		return new FunctionNode(
+			`${fn.name} (${fn.lineCount} lines)`,
+			hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
+			'function',
+			element.filePath,
+			fn.startLine,
+			fn
+		);
 	};
 
 	private checkChildrenFunctions(element: FunctionNode): FunctionNode[] {
@@ -121,18 +137,9 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 		if(!element.funcMatch?.children) {
 			return [];
 		}
-		
 		const children = element.funcMatch.children;
 		const childNodes = children.map(child => {
-			const hasChildren = child.children && child.children.length > 0;
-			return new FunctionNode(
-				`${child.name} (${child.lineCount} lines)`,
-				hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-				'function',
-				element.filePath,
-				child.startLine,
-				child
-			);
+			return this.functionHasChildren(child, element);
 		});
 		return childNodes;
 	}
@@ -157,6 +164,30 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 		return Promise.resolve([]);
 	}
 
+	/**
+	 * Compare two Maps of function matches for equality
+	 * Returns true if maps have identical content (deep comparison)
+	 */
+	private mapsEqual(map1: Map<string, FunctionMatch[]>, map2: Map<string, FunctionMatch[]>): boolean {
+		if (map1.size !== map2.size) {
+			return false;
+		}
+		
+		for (const [key, value1] of map1) {
+			const value2 = map2.get(key);
+			if (!value2) {
+				return false;
+			}
+			
+			// Deep compare arrays using JSON stringification
+			if (JSON.stringify(value1) !== JSON.stringify(value2)) {
+				return false;
+			}
+		}
+		
+		return true;
+	}
+
 	updateData(fileMap: Map<string, FunctionMatch[]>) {
 		// Filter out files with no functions
 		const filtered = new Map<string, FunctionMatch[]>();
@@ -165,17 +196,36 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 				filtered.set(filePath, functions);
 			}
 		});
-		this.functionsData = filtered;
-		this._onDidChangeTreeData.fire();
+		
+		// Only fire change event if data actually differs from current state
+		if (!this.mapsEqual(this.functionsData, filtered)) {
+			this.functionsData = filtered;
+			this._onDidChangeTreeData.fire();
+		}
 	}
 
 	updateSingleFile(filePath: string, functions: FunctionMatch[]) {
+		const oldFunctions = this.functionsData.get(filePath);
+		let hasChanged = false;
+		
 		if (functions.length > 0) {
-			this.functionsData.set(filePath, functions);
+			// Check if new data differs from old data
+			if (!oldFunctions || JSON.stringify(oldFunctions) !== JSON.stringify(functions)) {
+				this.functionsData.set(filePath, functions);
+				hasChanged = true;
+			}
 		} else {
-			this.functionsData.delete(filePath);
+			// Check if we're removing an entry that existed
+			if (oldFunctions !== undefined) {
+				this.functionsData.delete(filePath);
+				hasChanged = true;
+			}
 		}
-		this._onDidChangeTreeData.fire();
+		
+		// Only fire change event if something actually changed
+		if (hasChanged) {
+			this._onDidChangeTreeData.fire();
+		}
 	}
 }
 
@@ -200,29 +250,23 @@ class FunctionNode {
 	) {}
 }
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
-export async function activate(context: vscode.ExtensionContext) {
-
-	console.log('cleanExtension is now active!');
-
-	// Initialize logger
-	logger = new Logger('Function Scanner');
-
-	// Initialize performance logger
+function initPerformanceLogger(){
 	const workspaceFolders = vscode.workspace.workspaceFolders;
 	if (workspaceFolders) {
 		performanceLogger = new PerformanceLogger(workspaceFolders[0].uri);
 	}
+	return workspaceFolders;
+};
 
-	// Initialize tree view provider
+function initTreeView(context: vscode.ExtensionContext) {
 	functionTreeProvider = new FunctionTreeDataProvider();
 	treeView = vscode.window.createTreeView('functionScannerView', {
 		treeDataProvider: functionTreeProvider
 	});
 	context.subscriptions.push(treeView);
+};
 
-	// Register open function command
+function registerOpenFunctionCommand(context: vscode.ExtensionContext) {
 	const openFunctionDisposable = vscode.commands.registerCommand('cle.openFunction', async (filePath: string, startLine: number) => {
 		const document = await vscode.workspace.openTextDocument(filePath);
 		const editor = await vscode.window.showTextDocument(document);
@@ -231,126 +275,122 @@ export async function activate(context: vscode.ExtensionContext) {
 		editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
 	});
 	context.subscriptions.push(openFunctionDisposable);
+};
 
-	// Register scan command - use native symbols only
+function RegisterScanCommand(context: vscode.ExtensionContext) {
 	const disposable = vscode.commands.registerCommand('cle.scanUsingVSCodeSymbols', async () => {
 		await runScanUsingNativeSymbols();
 	});
 	context.subscriptions.push(disposable);
+};
 
-	// Create status bar item
+function createStatusBarItem(context: vscode.ExtensionContext) {
 	statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	statusBarItem.command = 'cle.scanUsingVSCodeSymbols';
 	updateStatusBar();
 	statusBarItem.show();
 	context.subscriptions.push(statusBarItem);
+};
 
-	// Watch for file changes using new FileWatcher for better debouncing
-	if (workspaceFolders) {
-		fileWatcherInstance = new FileWatcher();
-		
-		// Start the file watcher for this workspace
-		await fileWatcherInstance.start(
-			workspaceFolders[0].uri.fsPath,
-			['.ts', '.tsx', '.js', '.jsx']
-		);
 
-		// Subscribe to file change events - trigger incremental rescanning with 15s delay
-		fileWatcherInstance.onFileChange(async (event) => {
-			// For modified files - schedule rescan with 15s debounce
-			for (const modifiedFile of event.modified) {
-				scheduleFileScan(modifiedFile);
-			}
-			
-			// For deleted files - remove from cache and tree immediately
-			for (const deletedFile of event.deleted) {
-				// Clear pending rescan if exists
-				const timer = rescanTimers.get(deletedFile);
-				if (timer) {
-					clearTimeout(timer);
-					rescanTimers.delete(deletedFile);
-				}
-				memoryCache.delete(deletedFile);
-				functionTreeProvider.updateSingleFile(deletedFile, []);
-			}
-			
-			// For added files - do a full re-scan to integrate new files
-			if (event.added.length > 0) {
-				scheduleScan();
-			}
-		});
-		
-		context.subscriptions.push({ dispose: () => fileWatcherInstance?.dispose() });
-	}
-
-	// Keep VSCode's file watcher for compatibility (now acts as fallback)
+function createFileWatcher(context: vscode.ExtensionContext) {
+	
 	fileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx}');
 	fileWatcher.onDidChange(async (uri) => {
-		// Incremental rescan with 15s debounce for modified file
 		scheduleFileScan(uri.fsPath);
 	});
+
 	fileWatcher.onDidCreate(async (uri) => {
-		// New file - full rescan to integrate
-		scheduleScan();
+		scheduleFileScan(uri.fsPath);
 	});
+
 	fileWatcher.onDidDelete(async (uri) => {
-		// Remove pending rescan and clear cache/tree
-		const timer = rescanTimers.get(uri.fsPath);
-		if (timer) {
-			clearTimeout(timer);
-			rescanTimers.delete(uri.fsPath);
-		}
-		memoryCache.delete(uri.fsPath);
+		removeRescan(uri);
 		functionTreeProvider.updateSingleFile(uri.fsPath, []);
 		updateStatusBar();
 	});
 	context.subscriptions.push(fileWatcher);
+};
 
-	// Push logger to disposables
+function removeRescan(uri: vscode.Uri){
+	const timer = rescanTimers.get(uri.fsPath);
+	if (timer) {
+		clearTimeout(timer);
+		rescanTimers.delete(uri.fsPath);
+	}
+	memoryCache.delete(uri.fsPath);
+};
+
+// This method is called when your extension is activated
+// Your extension is activated the very first time the command is executed
+export async function activate(context: vscode.ExtensionContext) {
+
+	logger = new Logger('Function Scanner');
+	const workspaceFolders = initPerformanceLogger();
+	initTreeView(context);
+	registerOpenFunctionCommand(context);
+	RegisterScanCommand(context);
+	createStatusBarItem(context);
+	createFileWatcher(context);
+
 	context.subscriptions.push(logger);
 
-	// Pre-warm the language server BEFORE scan (separate from main processing)
+	// Discover files once and use for both warmup and main scan to avoid duplicate discovery
 	if (workspaceFolders) {
-		await warmupLanguageServer(workspaceFolders[0]);
+		try {
+			const documents = await getAllFiles(workspaceFolders[0]);
+			if (documents && documents.length > 0) {
+				// Pre-warm the language server with discovered files
+				await warmupLanguageServer(documents);
+				// Initial scan on startup (non-blocking, LS is already warm, files already discovered)
+				runScanUsingNativeSymbols(false, documents);
+			} else {
+				// No files found, run scan without pre-discovery
+				runScanUsingNativeSymbols(false);
+			}
+		} catch (error) {
+			// If discovery fails, run scan normally
+			runScanUsingNativeSymbols(false);
+		}
 	}
+}
 
-	// Initial scan on startup (non-blocking, LS is already warm)
-	runScanUsingNativeSymbols(false);
+async function getAllFiles(workspaceFolder: vscode.WorkspaceFolder): Promise<vscode.Uri[] | null> {
+	const documents = await vscode.workspace.findFiles(
+	new vscode.RelativePattern(workspaceFolder, '**/*.{ts,tsx,js,jsx}'),
+		`{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.next/**,**/out/**,**/coverage/**,**/.vscode/**,**/.cache/**,**/tmp/**,**/temp/**,**/.nuxt/**}`
+	);
+	if (documents.length === 0) {
+		return null;
+	}else {
+		return documents;
+	};
+};
+
+const testFilePatterns =[/test/i, /spec/i, /mock/i];
+
+function findWarmupFile(sortedDocs: vscode.Uri[]): vscode.Uri | null {
+	let warmupFile: vscode.Uri | null = null;
+	for (const doc of sortedDocs) {
+		const filename = doc.fsPath.toLowerCase();
+		const isTestFile = testFilePatterns.some(pattern => pattern.test(filename));
+		if (!isTestFile) {
+			warmupFile = doc;
+			break;
+		}
+	}
+	return warmupFile;
 }
 
 /**
  * Pre-warm the language server by fetching symbols from one file
  * This initializes the JS language server before the parallel batch scan begins
+ * @param documents - Pre-discovered list of source files (avoids duplicate discovery)
  */
-async function warmupLanguageServer(workspaceFolder: vscode.WorkspaceFolder): Promise<void> {
+async function warmupLanguageServer(documents: vscode.Uri[]): Promise<void> {
 	try {
-		// Find all source files
-		const documents = await vscode.workspace.findFiles(
-			new vscode.RelativePattern(workspaceFolder, '**/*.{ts,tsx,js,jsx}'),
-			`{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.next/**,**/out/**,**/coverage/**,**/.vscode/**,**/.cache/**,**/tmp/**,**/temp/**,**/.nuxt/**}`
-		);
-
-		if (documents.length === 0) {
-			return;
-		}
-
-		// Sort files alphabetically
 		const sortedDocs = documents.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
-
-		// Find the first non-test file
-		const testFilePatterns = [/test/i, /spec/i, /mock/i];
-		let warmupFile: vscode.Uri | null = null;
-
-		for (const doc of sortedDocs) {
-			const filename = doc.fsPath.toLowerCase();
-			const isTestFile = testFilePatterns.some(pattern => pattern.test(filename));
-			
-			if (!isTestFile) {
-				warmupFile = doc;
-				break;
-			}
-		}
-
+		const warmupFile = findWarmupFile(sortedDocs);
 		if (warmupFile) {
 			// Single warmup call - initializes the JS language server
 			await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
@@ -363,27 +403,15 @@ async function warmupLanguageServer(workspaceFolder: vscode.WorkspaceFolder): Pr
 	}
 }
 
-function scheduleScan(): void {
-	// Clear existing timeout
-	if (scanTimeout) {
-		clearTimeout(scanTimeout);
-	}
-
-	// Set new timeout and trigger native symbol scan
-	scanTimeout = setTimeout(async () => {
-		// Use native symbol scan instead of custom parser
-		await runScanUsingNativeSymbols(false);
-
-		scanTimeout = undefined;
-	}, 10000);
-}
-
 /**
  * Scan using VS Code's native symbol API (more accurate than custom parser)
  * Now using multiple parallel batches for performance
+ * @param showPopup - Whether to show completion message
+ * @param preDiscoveredDocs - Optional pre-discovered files to avoid duplicate discovery
  */
-async function runScanUsingNativeSymbols(showPopup: boolean = true) {
+async function runScanUsingNativeSymbols(showPopup: boolean = true, preDiscoveredDocs?: vscode.Uri[]) {
 	const workspaceFolders = vscode.workspace.workspaceFolders;
+
 	if (!workspaceFolders) {
 		logger.error('No workspace folder found!');
 		return;
@@ -401,14 +429,19 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true) {
 
 		const workspaceFolder = workspaceFolders[0];
 
-		// Get all source files in this workspace folder only
-		const documents = await vscode.workspace.findFiles(
-			new vscode.RelativePattern(
-				workspaceFolder,
-				'**/*.{ts,tsx,js,jsx}'
-			),
-			`{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.next/**,**/out/**,**/coverage/**,**/.vscode/**,**/.cache/**,**/tmp/**,**/temp/**,**/.nuxt/**}`
-		);
+		// Get all source files (either from pre-discovery during activation or discover now)
+		let documents: vscode.Uri[];
+		if (preDiscoveredDocs) {
+			documents = preDiscoveredDocs;
+		} else {
+			documents = await vscode.workspace.findFiles(
+				new vscode.RelativePattern(
+					workspaceFolder,
+					'**/*.{ts,tsx,js,jsx}'
+				),
+				`{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.next/**,**/out/**,**/coverage/**,**/.vscode/**,**/.cache/**,**/tmp/**,**/temp/**,**/.nuxt/**}`
+			);
+		}
 		
 		// Sort files alphabetically for deterministic processing order
 		// This ensures the warmup file is processed early
@@ -424,16 +457,27 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true) {
 		// Helper function to process a single file
 		const processSingleFile = async (docUri: vscode.Uri): Promise<{ path: string; functions: FunctionMatch[] | null }> => {
 			try {
-				// Check memory cache first
+				// Check memory cache first - validate against file modification time
 				const cached = memoryCache.get(docUri.fsPath);
 				if (cached) {
-					if (performanceLogger) {
-						performanceLogger.logSymbolFetch(docUri.fsPath, 0, cached.length);
+					try {
+						const stats = statSync(docUri.fsPath);
+						// Use cache only if file hasn't been modified since we cached it
+						if (stats.mtimeMs === cached.modTime) {
+							if (performanceLogger) {
+								performanceLogger.logSymbolFetch(docUri.fsPath, 0, cached.data.length);
+							}
+							return { path: docUri.fsPath, functions: cached.data };
+						}
+						// File was modified, invalidate cache
+						memoryCache.delete(docUri.fsPath);
+					} catch (err) {
+						// If we can't stat the file, invalidate cache
+						memoryCache.delete(docUri.fsPath);
 					}
-					return { path: docUri.fsPath, functions: cached };
 				}
 
-				// Cache miss - fetch symbols from VS Code API
+				// Cache miss or invalidated - fetch symbols from VS Code API
 				const symbolFetchStart = performance.now();
 				const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
 					'vscode.executeDocumentSymbolProvider',
@@ -464,9 +508,18 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true) {
 					);
 				}
 
-				// Store in memory cache
+				// Store in memory cache with modification time
 				if (result.functions.length > 0) {
-					memoryCache.set(docUri.fsPath, result.functions);
+					try {
+						const stats = statSync(docUri.fsPath);
+						memoryCache.set(docUri.fsPath, {
+							data: result.functions,
+							modTime: stats.mtimeMs
+						});
+					} catch (err) {
+						// If we can't stat the file, store without modTime tracking
+						// (file may have been deleted or is inaccessible)
+					}
 					return { path: docUri.fsPath, functions: result.functions };
 				}
 
@@ -562,7 +615,7 @@ async function rescanSingleFile(filePath: string): Promise<void> {
 		memoryCache.delete(filePath);
 
 		// If file was deleted or we can't read it, remove from tree
-		if (!require('fs').existsSync(filePath)) {
+		if (!existsSync(filePath)) {
 			functionTreeProvider.updateSingleFile(filePath, []);
 			updateStatusBar();
 			return;
@@ -585,9 +638,17 @@ async function rescanSingleFile(filePath: string): Promise<void> {
 
 		const result = await flattenSymbolsAsync(symbols, filePath, 5);
 
-		// Cache the result
+		// Cache the result with modification time
 		if (result.functions.length > 0) {
-			memoryCache.set(filePath, result.functions);
+			try {
+				const stats = statSync(filePath);
+				memoryCache.set(filePath, {
+					data: result.functions,
+					modTime: stats.mtimeMs
+				});
+			} catch (err) {
+				// If we can't stat the file, skip caching
+			}
 			functionTreeProvider.updateSingleFile(filePath, result.functions);
 		} else {
 			functionTreeProvider.updateSingleFile(filePath, []);
@@ -598,6 +659,12 @@ async function rescanSingleFile(filePath: string): Promise<void> {
 		// Silently fail on rescan errors
 	}
 }
+
+const FUNCTION_LIKE_KINDS = new Set([
+    vscode.SymbolKind.Function,
+    vscode.SymbolKind.Method,
+    vscode.SymbolKind.Constructor
+]);
 
 /**
  * Flatten nested DocumentSymbols using async/await with Promise-based recursion (Option 2)
@@ -626,11 +693,7 @@ async function flattenSymbolsAsync(
 			processedSymbols++;
 
 			// Count only function-like symbols
-			if (
-				sym.kind === vscode.SymbolKind.Function ||
-				sym.kind === vscode.SymbolKind.Method ||
-				sym.kind === vscode.SymbolKind.Constructor
-			) {
+			if (FUNCTION_LIKE_KINDS.has(sym.kind)) {
 				const lineCount =
 					sym.range.end.line - sym.range.start.line + 1;
 
@@ -685,7 +748,7 @@ async function flattenSymbolsAsync(
 			(process.memoryUsage().heapUsed - startMemory) / 1024; // KB
 
 		logger.info(
-			`[flattenSymbolsAsync] File: ${path.basename(filePath)} | ` +
+			`[flattenSymbolsAsync] File: ${basename(filePath)} | ` +
 			`Processed: ${processedSymbols} symbols | ` +
 			`Created: ${createdFunctions} functions | ` +
 			`Time: ${overallElapsed.toFixed(2)}ms | ` +
@@ -704,7 +767,7 @@ async function flattenSymbolsAsync(
 		};
 	} catch (error) {
 		logger.error(
-			`Async processing failed for ${path.basename(filePath)}`,
+			`Async processing failed for ${basename(filePath)}`,
 			error instanceof Error ? error : new Error(String(error))
 		);
 		return {
@@ -718,81 +781,6 @@ async function flattenSymbolsAsync(
 			},
 		};
 	}
-}
-
-/**
- * Flatten nested DocumentSymbols into a flat array of functions >= threshold lines
- * With performance and memory tracking (fallback synchronous version)
- */
-function flattenSymbols(
-	symbols: vscode.DocumentSymbol[],
-	filePath: string,
-	threshold: number
-): FunctionMatch[] {
-	const startTime = performance.now();
-	const startMemory = process.memoryUsage().heapUsed;
-	let processedSymbols = 0;
-	let createdFunctions = 0;
-
-	const functions: FunctionMatch[] = [];
-
-	function processSymbols(
-		syms: vscode.DocumentSymbol[],
-		parent?: FunctionMatch
-	): void {
-		for (const sym of syms) {
-			processedSymbols++;
-
-			// Count only function-like symbols
-			if (
-				sym.kind === vscode.SymbolKind.Function ||
-				sym.kind === vscode.SymbolKind.Method ||
-				sym.kind === vscode.SymbolKind.Constructor
-			) {
-				const lineCount =
-					sym.range.end.line - sym.range.start.line + 1;
-
-				if (lineCount >= threshold) {
-					const func: FunctionMatch = {
-						name: sym.name,
-						startLine: sym.range.start.line + 1,
-						endLine: sym.range.end.line + 1,
-						lineCount,
-						metrics: { parser: 'vscode-symbols' },
-						children: [],
-					};
-
-					createdFunctions++;
-
-					if (parent) {
-						// Add as child of parent function
-						if (!parent.children) {
-							parent.children = [];
-						}
-						parent.children.push(func);
-					} else {
-						// Top-level function
-						functions.push(func);
-					}
-
-					// Process children (nested functions)
-					if (sym.children) {
-						processSymbols(sym.children, func);
-					}
-				} else if (sym.children) {
-					// Still check children even if parent is below threshold
-					processSymbols(sym.children, parent);
-				}
-			} else if (sym.children) {
-				// For non-function symbols (classes, interfaces), check their children
-				processSymbols(sym.children, parent);
-			}
-		}
-	}
-
-	processSymbols(symbols);
-
-	return functions;
 }
 
 function updateStatusBar(): void {
@@ -818,9 +806,6 @@ function setBadge(total:number){
 export function deactivate() {
 	if (scanTimeout) {
 		clearTimeout(scanTimeout);
-	}
-	if (fileWatcherInstance) {
-		fileWatcherInstance.dispose();
 	}
 	if (fileWatcher) {
 		fileWatcher.dispose();
