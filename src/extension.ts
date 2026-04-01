@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import { basename, normalize } from 'path';
 import { Logger } from './utils/Logger';
 import { PerformanceLogger } from './utils/PerformanceLogger';
-import { existsSync, statSync } from 'fs';
+import { existsSync, statSync, Stats } from 'fs';
 
 /**
  * Configuration constants for the Function Scanner extension
@@ -267,17 +267,32 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	}
 
 	updateData(fileMap: Map<string, FunctionMatch[]>) {
-		// Filter out files with no functions
-		const filtered = new Map<string, FunctionMatch[]>();
-		fileMap.forEach((functions, filePath) => {
-			if (functions.length > 0) {
-				filtered.set(filePath, functions);
+		// Optimization: Selective updates instead of deep comparison
+		// Only update files that differ, avoiding expensive O(n³) comparison
+		let changed = false;
+
+		// Update or add files that have functions
+		for (const [filePath, newFunctions] of fileMap) {
+			if (newFunctions.length > 0) {
+				const oldFunctions = this.functionsData.get(filePath);
+				// Only update if this file is new or has different functions
+				if (!oldFunctions || !this.arraysEqual(oldFunctions, newFunctions)) {
+					this.functionsData.set(filePath, newFunctions);
+					changed = true;
+				}
 			}
-		});
-		
-		// Only fire change event if data actually differs from current state
-		if (!this.mapsEqual(this.functionsData, filtered)) {
-			this.functionsData = filtered;
+		}
+
+		// Remove files that are in the old data but not in the new fileMap
+		for (const filePath of this.functionsData.keys()) {
+			if (!fileMap.has(filePath) || fileMap.get(filePath)!.length === 0) {
+				this.functionsData.delete(filePath);
+				changed = true;
+			}
+		}
+
+		// Only fire change event if actual changes occurred
+		if (changed) {
 			this._onDidChangeTreeData.fire();
 		}
 	}
@@ -567,12 +582,14 @@ async function processSingleFile(docUri: vscode.Uri): Promise<{ path: string; fu
 		}
 
 		// Check memory cache first - validate against file modification time
+		// Optimization: Reuse stats object to avoid duplicate statSync() calls
+		let fileStats: Stats | null = null;
 		const cached = memoryCache.get(docUri.fsPath);
 		if (cached) {
 			try {
-				const stats = statSync(docUri.fsPath);
+				fileStats = statSync(docUri.fsPath);
 				// Use cache only if file hasn't been modified since we cached it
-				if (stats.mtimeMs === cached.modTime) {
+				if (fileStats.mtimeMs === cached.modTime) {
 					if (performanceLogger) {
 						performanceLogger.logSymbolFetch(docUri.fsPath, 0, cached.data.length);
 					}
@@ -582,7 +599,7 @@ async function processSingleFile(docUri: vscode.Uri): Promise<{ path: string; fu
 				invalidateFileCache(docUri.fsPath);
 			} catch (err) {
 				// If we can't stat the file, invalidate cache
-			invalidateFileCache(docUri.fsPath);
+				invalidateFileCache(docUri.fsPath);
 			}
 		}
 
@@ -620,10 +637,14 @@ async function processSingleFile(docUri: vscode.Uri): Promise<{ path: string; fu
 		// Store in memory cache with modification time
 		if (result.functions.length > 0) {
 			try {
-				const stats = statSync(docUri.fsPath);
+				// Only call statSync if we haven't already called it above
+				// This eliminates the duplicate statSync() on cache validation
+				if (!fileStats) {
+					fileStats = statSync(docUri.fsPath);
+				}
 				memoryCache.set(docUri.fsPath, {
 					data: result.functions,
-					modTime: stats.mtimeMs
+					modTime: fileStats.mtimeMs
 				});
 			} catch (err) {
 				// If we can't stat the file, store without modTime tracking
