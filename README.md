@@ -2,7 +2,7 @@
 
 An efficient, extensible code scanner that identifies functions longer than a specified threshold (default: 5 lines) across your TypeScript/JavaScript workspace. Built with a modern plugin system following **DRY** (Don't Repeat Yourself) and **KISS** (Keep It Simple, Stupid) principles.
 
-![Version](https://img.shields.io/badge/version-0.0.1-blue)
+![Version](https://img.shields.io/badge/version-1.0.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Features
