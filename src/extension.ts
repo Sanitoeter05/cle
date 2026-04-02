@@ -54,22 +54,12 @@ const memoryCache: Map<string, CacheEntry> = new Map();
 const rescanTimers: Map<string, NodeJS.Timeout> = new Map();
 
 /**
- * Invalidate the cache entry for a specific file
- * Used consistently across all cache invalidation points
- * @param filePath - The file path to invalidate cache for
- */
-function invalidateFileCache(filePath: string): void {
-	memoryCache.delete(filePath);
-}
-
-/**
  * Convert an unknown error type to a standardized Error instance
  * Handles both Error objects and other types (strings, null, undefined, etc.)
  * Does NOT sanitize - Logger handles that internally via sanitizeError()
  * @param error - The error to convert
  * @returns An Error instance
  */
-
 function toError(error: unknown): Error {
 	if (error instanceof Error) {
 		return error;
@@ -83,19 +73,22 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	onDidChangeTreeData: vscode.Event<FunctionNode | undefined | null | void> = this._onDidChangeTreeData.event;
 
 	private functionsData: Map<string, FunctionMatch[]> = new Map();
+	
+	//Implement Surface
+	getTreeItem(element: FunctionNode): vscode.TreeItem {
+		const treeItem = this.getNewTreeItem(element);
+		
+		return this.applyTreeItemFilters(element, treeItem);
+	};
 
-	getTotalCount(): number {
+	// functions
+	
+	public getTotalCount(): number {
 		let total = 0;
 		this.functionsData.forEach(functions => {
 			total += functions.length;
 		});
 		return total;
-	};
-
-	getTreeItem(element: FunctionNode): vscode.TreeItem {
-		const treeItem = this.getNewTreeItem(element);
-		
-		return this.applyTreeItemFilters(element, treeItem);
 	};
 
 	private applyTreeItemFilters(element: FunctionNode, treeItem: vscode.TreeItem): vscode.TreeItem {
@@ -121,42 +114,32 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 
 	private getTreeFunction(treeItem: vscode.TreeItem, element: FunctionNode): void {
 		treeItem.iconPath = new vscode.ThemeIcon('symbol-function');
-		treeItem.command = {
-			command: 'cle.openFunction',
-			title: 'Open Function',
-			arguments: [element.filePath, element.startLine]
-		};
+		treeItem.command = { command: 'cle.openFunction',title: 'Open Function',arguments: [element.filePath, element.startLine] };
 	};
 
 	private async filterChildrensForFunction(){
-		const files: FunctionNode[] = [];
-		const promises = Array.from(this.functionsData).map(([filePath, functions]) =>
-			this.checkFile(functions, filePath, files)
-		);
+		let files: FunctionNode[] = [];
+		const promises = this.checkFilesChildren(files);
 		await Promise.all(promises);
 		return files;
+	};
+
+	private checkFilesChildren(files: FunctionNode[]): Promise<void>[] {
+		return Array.from(this.functionsData).map(([filePath, functions]) =>
+			this.checkFile(functions, filePath, files)
+		);
 	};
 
 	private async checkFile(functions: FunctionMatch[], filePath: string, files: FunctionNode[]){
 		if (functions.length > 0) {
 			const count = functions.length;
-			files.push(new FunctionNode(
-				basename(filePath),
-				vscode.TreeItemCollapsibleState.Collapsed,
-				'file',
-				filePath,
-				0,
-				undefined,
-				count
-			));
+			files.push(new FunctionNode(basename(filePath),vscode.TreeItemCollapsibleState.Collapsed,'file',filePath,0,undefined,count));
 		};
 	};
 
 	private checkFiles(element: FunctionNode){
-		// File level - show top-level functions
 		const functions = this.functionsData.get(element.filePath) || [];
 		const functionNodes = functions.map(fn => {
-			// Determine if this function has children
 			return this.functionHasChildren(fn, element);
 		});
 		return functionNodes;
@@ -164,163 +147,168 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 
 	private functionHasChildren(fn:FunctionMatch, element: FunctionNode): FunctionNode {
 		const hasChildren = fn.children && fn.children.length > 0;
-		return new FunctionNode(
-			`${fn.name} (${fn.lineCount} lines)`,
-			hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-			'function',
-			element.filePath,
-			fn.startLine,
-			fn
-		);
+		return new FunctionNode(`${fn.name} (${fn.lineCount} lines)`,hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,'function',element.filePath,fn.startLine,fn);
 	};
 
 	private checkChildrenFunctions(element: FunctionNode): FunctionNode[] {
-		// Function level - show nested functions (children)
-		if(!element.funcMatch?.children) {
-			return [];
-		}
-		const children = element.funcMatch.children;
+		const children = element.funcMatch?.children || [];
 		const childNodes = children.map(child => {
 			return this.functionHasChildren(child, element);
 		});
 		return childNodes;
-	}
+	};
 
-	getChildren(element?: FunctionNode): Thenable<FunctionNode[]> {
+	public getChildren(element?: FunctionNode): Thenable<FunctionNode[]> {
 		if (!element) {
-			return (async () => {
-				let files = await this.filterChildrensForFunction();
-				
-				if (files.length === 0) {
-					files.push(new FunctionNode('👉 Run "Scan for Functions Longer Than 5 Lines" to begin', vscode.TreeItemCollapsibleState.None, 'empty', '', 0, undefined));
-				}
-				
-				return files;
-			})();
+			return this.emptyMessage();
 		} else if (element.type === 'file') {
 			return Promise.resolve(this.checkFiles(element));
 		} else if (element.type === 'function' && element.funcMatch?.children) {
 			return Promise.resolve(this.checkChildrenFunctions(element));
 		}
-
 		return Promise.resolve([]);
 	}
 
-	/**
-	 * Compare two Maps of function matches for equality
-	 * Returns true if maps have identical content (deep comparison)
-	 * Uses property-based comparison instead of JSON.stringify for performance
-	 */
-	private mapsEqual(map1: Map<string, FunctionMatch[]>, map2: Map<string, FunctionMatch[]>): boolean {
-		if (map1.size !== map2.size) {
-			return false;
-		}
-		
-		for (const [key, value1] of map1) {
-			const value2 = map2.get(key);
-			if (!value2 || !this.arraysEqual(value1, value2)) {
-				return false;
-			}
-		}
-		
-		return true;
+	private async emptyMessage(){
+		let files = this.getDefaultMessage(await this.filterChildrensForFunction());						
+		return files;
 	}
+
+	private getDefaultMessage(files: FunctionNode[]): FunctionNode[] {
+		if (files.length === 0) {
+			files.push(new FunctionNode('👉 Run "Scan for Functions Longer Than 5 Lines" to begin', vscode.TreeItemCollapsibleState.None, 'empty', '', 0, undefined));
+		};
+		return files;
+	};
 
 	/**
 	 * Compare two arrays of FunctionMatch objects for equality
 	 * Returns true if arrays have same length and all elements are equal
 	 */
 	private arraysEqual(arr1: FunctionMatch[], arr2: FunctionMatch[]): boolean {
-		if (arr1.length !== arr2.length) {
+		if(!this.functionMatchEqualWithChildren(arr1, arr2) && !this.arrayFunctionMatches(arr1, arr2)) {
 			return false;
-		}
-		
-		for (let i = 0; i < arr1.length; i++) {
-			if (!this.functionMatchEqual(arr1[i], arr2[i])) {
-				return false;
-			}
-		}
-		
+		};
 		return true;
 	}
+
+	private arrayFunctionMatches(arr1: FunctionMatch[], arr2: FunctionMatch[]): boolean {
+		for (let i = 0; i < arr1.length; i++) {
+			this.matchesEqual(arr1[i], arr2[i]);
+		};
+		return false;
+	};
+
+	private matchesEqual(arr1: FunctionMatch, arr2: FunctionMatch): boolean {
+		if (this.functionMatchEqual(arr1, arr2)) {
+			return true;
+		}
+		return false;
+	};
+
+	private functionMatchEqualWithChildren(fn1: FunctionMatch[], fn2: FunctionMatch[]): boolean {
+		if (fn1.length === fn2.length) {
+			return true;
+		}
+		return false;
+	};
 
 	/**
 	 * Compare two FunctionMatch objects for equality
 	 * Performs recursive comparison of children arrays
 	 */
 	private functionMatchEqual(fn1: FunctionMatch, fn2: FunctionMatch): boolean {
-		// Compare basic properties
-		if (fn1.name !== fn2.name ||
-			fn1.startLine !== fn2.startLine ||
-			fn1.endLine !== fn2.endLine ||
-			fn1.lineCount !== fn2.lineCount) {
-			return false;
+		if (this.comparePropertys(fn1, fn2)&& this.compeareArrayHasChildren(fn1, fn2) && (fn1.children && fn2.children)) {
+			return this.arraysEqual(fn1.children, fn2.children );
 		}
-
-		// Compare children arrays
-		if (!fn1.children && !fn2.children) {
-			return true; // Both have no children
-		}
-		if (!fn1.children || !fn2.children) {
-			return false; // One has children, the other doesn't
-		}
-		return this.arraysEqual(fn1.children, fn2.children);
+		return false;
 	}
 
-	updateData(fileMap: Map<string, FunctionMatch[]>) {
-		// Optimization: Selective updates instead of deep comparison
-		// Only update files that differ, avoiding expensive O(n³) comparison
-		let changed = false;
-
-		// Update or add files that have functions
-		for (const [filePath, newFunctions] of fileMap) {
-			if (newFunctions.length > 0) {
-				const oldFunctions = this.functionsData.get(filePath);
-				// Only update if this file is new or has different functions
-				if (!oldFunctions || !this.arraysEqual(oldFunctions, newFunctions)) {
-					this.functionsData.set(filePath, newFunctions);
-					changed = true;
-				}
-			}
+	private comparePropertys(fn1: FunctionMatch, fn2: FunctionMatch): boolean {
+		if (fn1.name !== fn2.name || fn1.startLine !== fn2.startLine || fn1.endLine !== fn2.endLine || fn1.lineCount !== fn2.lineCount) {
+			return false;
 		}
+		return true;
+	};
 
-		// Remove files that are in the old data but not in the new fileMap
+	private compeareArrayHasChildren(fn1: FunctionMatch, fn2: FunctionMatch): boolean {
+		if ((!fn1.children && fn2.children) || (fn1.children && !fn2.children)) {
+			return false;
+		};
+		return true;
+	};
+
+	public updateData(fileMap: Map<string, FunctionMatch[]>) {
+		let changed = false;
+		changed = this.addOrUpdateFile(fileMap) || changed;
+		changed = this.removeDeletedFiles(fileMap) || changed;
+		this.publishChanges(changed);
+	}
+
+	private publishChanges(changed: boolean): void {
+		if (changed) {
+			this._onDidChangeTreeData.fire();
+		};
+	};
+
+	private removeDeletedFiles(fileMap: Map<string, FunctionMatch[]>): boolean{
+		let changed = false;
 		for (const filePath of this.functionsData.keys()) {
-			if (!fileMap.has(filePath) || fileMap.get(filePath)!.length === 0) {
-				this.functionsData.delete(filePath);
+			if (this.invalidateFileCache(fileMap, filePath)) {
 				changed = true;
 			}
 		}
+		return changed;
+	};
 
-		// Only fire change event if actual changes occurred
-		if (changed) {
-			this._onDidChangeTreeData.fire();
+	private invalidateFileCache(fileMap: Map<string, FunctionMatch[]>, filePath: string): boolean {
+		if (!fileMap.has(filePath) || fileMap.get(filePath)!.length === 0) {
+			return this.functionsData.delete(filePath);
 		}
-	}
+		return false;
+	};
 
+	private addOrUpdateFile(fileMap : Map<string, FunctionMatch[]>): boolean {
+		let changed = false;
+		for (const [filePath, newFunctions] of fileMap) {
+			const oldFunctions = this.functionsData.get(filePath);
+			if (this.setFile(newFunctions, oldFunctions, filePath)) {
+				changed = true;
+			}
+		}
+		return changed;
+	};
+
+	private setFile(newFunctions: FunctionMatch[], oldFunctions: FunctionMatch[] | undefined, filePath: string): boolean {
+		if (newFunctions.length > 0 && this.fileChanged(oldFunctions, newFunctions)) {
+			this.functionsData.set(filePath, newFunctions);
+			return true;
+		}
+		return false;
+	};
+
+	private fileChanged(oldFunctions: FunctionMatch[] | undefined, newFunctions: FunctionMatch[]): boolean {
+		if (!oldFunctions || !this.arraysEqual(oldFunctions, newFunctions)) {
+			return true;
+		}
+		return false;
+	};
+	
+	
 	updateSingleFile(filePath: string, functions: FunctionMatch[]) {
 		const oldFunctions = this.functionsData.get(filePath);
-		let hasChanged = false;
-		
-		if (functions.length > 0) {
-			// Check if new data differs from old data
-			if (!oldFunctions || !this.arraysEqual(oldFunctions, functions)) {
-				this.functionsData.set(filePath, functions);
-				hasChanged = true;
-			}
-		} else {
-			// Check if we're removing an entry that existed
-			if (oldFunctions !== undefined) {
-				this.functionsData.delete(filePath);
-				hasChanged = true;
-			}
-		}
-		
-		// Only fire change event if something actually changed
-		if (hasChanged) {
-			this._onDidChangeTreeData.fire();
-		}
+		let changed = false;
+		this.setFile(functions, oldFunctions, filePath);
+		this.checkIfDeleted(oldFunctions, filePath, changed);
+		this.publishChanges(changed);
 	}
+
+	private checkIfDeleted(oldFunctions: FunctionMatch[] | undefined, filePath: string, changed: boolean): void {
+		if (oldFunctions !== undefined) {
+			this.functionsData.delete(filePath);
+			changed = true;
+		};
+	};
 }
 
 interface FunctionMatch {
@@ -333,15 +321,7 @@ interface FunctionMatch {
 }
 
 class FunctionNode {
-	constructor(
-		public label: string,
-		public collapsibleState: vscode.TreeItemCollapsibleState,
-		public type: 'file' | 'function' | 'empty',
-		public filePath: string,
-		public startLine: number,
-		public funcMatch?: FunctionMatch,
-		public functionCount: number = 0
-	) {}
+	constructor( public label: string, public collapsibleState: vscode.TreeItemCollapsibleState, public type: 'file' | 'function' | 'empty', public filePath: string, public startLine: number, public funcMatch?: FunctionMatch, public functionCount: number = 0 ) {}
 }
 
 function initPerformanceLogger(){
@@ -361,15 +341,17 @@ function initTreeView(context: vscode.ExtensionContext) {
 };
 
 function registerOpenFunctionCommand(context: vscode.ExtensionContext) {
-	const openFunctionDisposable = vscode.commands.registerCommand('cle.openFunction', async (filePath: string, startLine: number) => {
-		const document = await vscode.workspace.openTextDocument(filePath);
-		const editor = await vscode.window.showTextDocument(document);
-		const range = new vscode.Range(startLine - 1, 0, startLine - 1, 0);
-		editor.selection = new vscode.Selection(range.start, range.start);
-		editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-	});
+	const openFunctionDisposable = vscode.commands.registerCommand('cle.openFunction', commandCallback);
 	context.subscriptions.push(openFunctionDisposable);
 };
+
+async function commandCallback(filePath: string, startLine: number){
+	const document = await vscode.workspace.openTextDocument(filePath);
+	const editor = await vscode.window.showTextDocument(document);
+	const range = new vscode.Range(startLine - 1, 0, startLine - 1, 0);
+	editor.selection = new vscode.Selection(range.start, range.start);
+	editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+}
 
 function RegisterScanCommand(context: vscode.ExtensionContext) {
 	const disposable = vscode.commands.registerCommand('cle.scanUsingVSCodeSymbols', async () => {
@@ -388,23 +370,18 @@ function createStatusBarItem(context: vscode.ExtensionContext) {
 
 
 function createFileWatcher(context: vscode.ExtensionContext) {
-	
 	fileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx}');
-	fileWatcher.onDidChange(async (uri) => {
-		scheduleFileScan(uri.fsPath);
-	});
-
-	fileWatcher.onDidCreate(async (uri) => {
-		scheduleFileScan(uri.fsPath);
-	});
-
-	fileWatcher.onDidDelete(async (uri) => {
-		removeRescan(uri);
-		functionTreeProvider.updateSingleFile(uri.fsPath, []);
-		updateStatusBar();
-	});
+	fileWatcher.onDidChange(async (uri) => {scheduleFileScan(uri.fsPath);});
+	fileWatcher.onDidCreate(async (uri) => {scheduleFileScan(uri.fsPath);});
+	fileWatcher.onDidDelete(deleteWatcherListener);
 	context.subscriptions.push(fileWatcher);
 };
+
+async function deleteWatcherListener (uri: vscode.Uri){
+	removeRescan(uri);
+	functionTreeProvider.updateSingleFile(uri.fsPath, []);
+	updateStatusBar();
+}
 
 function removeRescan(uri: vscode.Uri){
 	const timer = rescanTimers.get(uri.fsPath);
@@ -1009,6 +986,7 @@ export function deactivate() {
 	fileWatcherDispose(fileWatcher);
 	statusBarItemDispose(statusBarItem);
 	loggerDispose(logger);
+	loggerDispose(logger);
 };
 
 function scanClearTimeouts(scanTimeout: NodeJS.Timeout | undefined) {
@@ -1028,8 +1006,13 @@ function statusBarItemDispose(statusBarItem: vscode.StatusBarItem | undefined) {
 		statusBarItem.dispose();
 	}
 };
+
 function loggerDispose(logger: Logger | undefined) {
 	if (logger) {
 		logger.dispose();
 	}
 };
+
+function invalidateFileCache(filePath: string): void {
+	memoryCache.delete(filePath);
+}
