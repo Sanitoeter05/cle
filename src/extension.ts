@@ -69,6 +69,7 @@ function invalidateFileCache(filePath: string): void {
  * @param error - The error to convert
  * @returns An Error instance
  */
+
 function toError(error: unknown): Error {
 	if (error instanceof Error) {
 		return error;
@@ -896,13 +897,13 @@ async function flattenSymbolsAsync(
 			// Count only function-like symbols
 			if (FUNCTION_LIKE_KINDS.has(sym.kind)) {
 				const lineCount =
-					sym.range.end.line - sym.range.start.line + 1;
+					(sym.range.end.line) - (sym.range.start.line + 1);
 
-				if (lineCount >= threshold) {
+				if (lineCount > threshold) {
 					const func: FunctionMatch = {
 						name: sym.name,
 						startLine: sym.range.start.line + 1,
-						endLine: sym.range.end.line + 1,
+						endLine: sym.range.end.line - 1,
 						lineCount,
 						metrics: { parser: 'vscode-symbols-async' },
 						children: [],
@@ -1003,18 +1004,32 @@ function setBadge(total:number){
 	};
 };
 
-// This method is called when your extension is deactivated
 export function deactivate() {
+	scanClearTimeouts(scanTimeout);
+	fileWatcherDispose(fileWatcher);
+	statusBarItemDispose(statusBarItem);
+	loggerDispose(logger);
+};
+
+function scanClearTimeouts(scanTimeout: NodeJS.Timeout | undefined) {
 	if (scanTimeout) {
 		clearTimeout(scanTimeout);
 	}
+};
+
+function fileWatcherDispose(fileWatcher: vscode.FileSystemWatcher | undefined) {
 	if (fileWatcher) {
 		fileWatcher.dispose();
 	}
+};
+
+function statusBarItemDispose(statusBarItem: vscode.StatusBarItem | undefined) {
 	if (statusBarItem) {
 		statusBarItem.dispose();
 	}
+};
+function loggerDispose(logger: Logger | undefined) {
 	if (logger) {
 		logger.dispose();
 	}
-}
+};
