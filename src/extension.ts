@@ -842,8 +842,7 @@ async function scanProcsses(filePath: string): Promise<void> {
 async function scaning(filePath: string, symbols: vscode.DocumentSymbol[]): Promise<void> {
 	invalidateFileCache(filePath);
 	updateTreeForEmptySymbols(filePath, symbols);
-	const result = await flattenSymbolsAsync(symbols, filePath);
-	cacheResult(result, filePath);
+	await cacheResult(filePath, symbols);
 	updateStatusBar();
 };
 
@@ -869,7 +868,8 @@ function updateTreeForEmptySymbols(filePath: string, symbols: vscode.DocumentSym
 	}
 };
 
-function cacheResult(result: { functions: FunctionMatch[]; elapsed: number; stats: any }, filePath: string, ): void {
+async function cacheResult(filePath: string, symbols: vscode.DocumentSymbol[]): Promise<void> {
+	const result = await flattenSymbolsAsync(symbols, filePath);
 	if (result.functions.length > 0) {
 		tryCaching(filePath, result);
 		functionTreeProvider.updateSingleFile(filePath, result.functions);
