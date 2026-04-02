@@ -431,9 +431,7 @@ async function tryUpdate(workspaceFolders: readonly vscode.WorkspaceFolder[]) {
 	try {
 		const documents = await getAllFiles(workspaceFolders[0]);
 		await updateDocuments(documents);
-	} catch (error) {
-		runScanUsingNativeSymbols(false);
-	}
+	} catch (error) {runScanUsingNativeSymbols(false);}
 };
 
 async function updateDocuments(documents: vscode.Uri[] | null) {
@@ -824,64 +822,65 @@ function clearSingleRescanTimer(filePath: string) {
  */
 async function rescanSingleFile(filePath: string): Promise<void> {
 	try {
-		// Validate file path for security
-		const workspaceFolders = vscode.workspace.workspaceFolders;
-		if (!workspaceFolders || !validateFilePath(filePath, workspaceFolders[0].uri)) {
-			logger.error(`Invalid or unsafe file path: ${filePath}`);
-			return;
-		}
-
-		// Invalidate cache for this file
-		invalidateFileCache(filePath);
-
-		// If file was deleted or we can't read it, remove from tree
-		if (!existsSync(filePath)) {
-			functionTreeProvider.updateSingleFile(filePath, []);
-			updateStatusBar();
-			return;
-		}
-
-		// Rescan just this one file
-		const docUri = vscode.Uri.file(filePath);
-		const symbolFetchStart = performance.now();
-		const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-			'vscode.executeDocumentSymbolProvider',
-			docUri
-		);
-		const symbolFetchDuration = performance.now() - symbolFetchStart;
-
-		if (!symbols || symbols.length === 0) {
-			functionTreeProvider.updateSingleFile(filePath, []);
-			updateStatusBar();
-			return;
-		}
-
-		const result = await flattenSymbolsAsync(symbols, filePath);
-
-		// Cache the result with modification time
-		if (result.functions.length > 0) {
-			try {
-				const stats = statSync(filePath);
-				memoryCache.set(filePath, {
-					data: result.functions,
-					modTime: stats.mtimeMs
-				});
-			} catch (err) {
-				// If we can't stat the file, skip caching
-			}
-			functionTreeProvider.updateSingleFile(filePath, result.functions);
-		} else {
-			functionTreeProvider.updateSingleFile(filePath, []);
-		}
-
-		updateStatusBar();
+		await scanProcsses(filePath);
 	} catch (error) {
-		logger.warn(
-			`Rescan failed for file ${filePath}: ${error instanceof Error ? error.message : String(error)}`
-		);
-		// Continue execution - rescan failure is non-critical for already-cached data
+		logger.warn(`Rescan failed for file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
+
+async function scanProcsses(filePath: string): Promise<void> {
+	if(!validateFilePathForRescan(filePath) || removeIfNotExists(filePath)) {return;}
+	const docUri = vscode.Uri.file(filePath);
+	const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>('vscode.executeDocumentSymbolProvider',docUri);
+	await scaning(filePath, symbols);
+};
+
+async function scaning(filePath: string, symbols: vscode.DocumentSymbol[]): Promise<void> {
+	invalidateFileCache(filePath);
+	updateTreeForEmptySymbols(filePath, symbols);
+	await cacheResult(filePath, symbols);
+	updateStatusBar();
+};
+
+function removeIfNotExists(filePath: string): boolean {
+	if (!existsSync(filePath)) {
+		functionTreeProvider.updateSingleFile(filePath, []);
+		updateStatusBar(); return true; }
+	return false;
+};
+
+function validateFilePathForRescan(filePath: string): boolean {
+	const workspaceFolders = vscode.workspace.workspaceFolders;
+	if (!workspaceFolders || !validateFilePath(filePath, workspaceFolders[0].uri)) {
+		logger.error(`Invalid or unsafe file path: ${filePath}`); return false;}
+	return true;
+};
+
+function updateTreeForEmptySymbols(filePath: string, symbols: vscode.DocumentSymbol[] | undefined) {
+	if (!symbols || symbols.length === 0) {
+		functionTreeProvider.updateSingleFile(filePath, []);
+		updateStatusBar();
+		return;
+	}
+};
+
+async function cacheResult(filePath: string, symbols: vscode.DocumentSymbol[]): Promise<void> {
+	const result = await flattenSymbolsAsync(symbols, filePath);
+	if (result.functions.length > 0) {
+		tryCaching(filePath, result);
+		functionTreeProvider.updateSingleFile(filePath, result.functions);
+	} else {
+		functionTreeProvider.updateSingleFile(filePath, []);
+	}
+};
+
+function tryCaching(filePath: string, result: { functions: FunctionMatch[]; elapsed: number; stats: any }): void {
+	try {
+		const stats = statSync(filePath);
+		memoryCache.set(filePath, {data: result.functions,modTime: stats.mtimeMs});
+	} catch (err) {logger.error(`Failed to stat file for caching: ${filePath} - ${err instanceof Error ? err.message : String(err)}`);}
+};
+
 
 const FUNCTION_LIKE_KINDS = new Set([
     vscode.SymbolKind.Function,
@@ -1049,6 +1048,7 @@ function statusBarItemDispose(statusBarItem: vscode.StatusBarItem | undefined) {
 		statusBarItem.dispose();
 	}
 };
+
 function loggerDispose(logger: Logger | undefined) {
 	if (logger) {
 		logger.dispose();
