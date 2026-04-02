@@ -449,9 +449,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
 async function getAllFiles(workspaceFolder: vscode.WorkspaceFolder): Promise<vscode.Uri[] | null> {
 	const documents = await vscode.workspace.findFiles(
-	new vscode.RelativePattern(workspaceFolder, '**/*.{ts,tsx,js,jsx}'),
-		`{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.next/**,**/out/**,**/coverage/**,**/.vscode/**,**/.cache/**,**/tmp/**,**/temp/**,**/.nuxt/**}`
-	);
+	new vscode.RelativePattern(workspaceFolder, '**/*.{ts,tsx,js,jsx}'),`{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.next/**,**/out/**,**/coverage/**,**/.vscode/**,**/.cache/**,**/tmp/**,**/temp/**,**/.nuxt/**}`);
+	return checkDocument(documents);
+};
+
+function checkDocument(documents: vscode.Uri[]): vscode.Uri[] | null {
 	if (documents.length === 0) {
 		return null;
 	}else {
