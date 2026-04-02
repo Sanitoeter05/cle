@@ -121,21 +121,21 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 
 	private getTreeFunction(treeItem: vscode.TreeItem, element: FunctionNode): void {
 		treeItem.iconPath = new vscode.ThemeIcon('symbol-function');
-		treeItem.command = {
-			command: 'cle.openFunction',
-			title: 'Open Function',
-			arguments: [element.filePath, element.startLine]
-		};
+		treeItem.command = {command: 'cle.openFunction',title: 'Open Function',arguments: [element.filePath, element.startLine]};
 	};
 
 	private async filterChildrensForFunction(){
 		const files: FunctionNode[] = [];
-		const promises = Array.from(this.functionsData).map(([filePath, functions]) =>
-			this.checkFile(functions, filePath, files)
-		);
+		const promises = this.mapArray(files); 
 		await Promise.all(promises);
 		return files;
 	};
+
+	private mapArray(files: FunctionNode[]) {
+		return Array.from(this.functionsData).map(([filePath, functions]) =>
+			this.checkFile(functions, filePath, files)
+		);
+	}
 
 	private async checkFile(functions: FunctionMatch[], filePath: string, files: FunctionNode[]){
 		if (functions.length > 0) {
@@ -153,10 +153,8 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	};
 
 	private checkFiles(element: FunctionNode){
-		// File level - show top-level functions
 		const functions = this.functionsData.get(element.filePath) || [];
 		const functionNodes = functions.map(fn => {
-			// Determine if this function has children
 			return this.functionHasChildren(fn, element);
 		});
 		return functionNodes;
@@ -333,15 +331,7 @@ interface FunctionMatch {
 }
 
 class FunctionNode {
-	constructor(
-		public label: string,
-		public collapsibleState: vscode.TreeItemCollapsibleState,
-		public type: 'file' | 'function' | 'empty',
-		public filePath: string,
-		public startLine: number,
-		public funcMatch?: FunctionMatch,
-		public functionCount: number = 0
-	) {}
+	constructor( public label: string, public collapsibleState: vscode.TreeItemCollapsibleState, public type: 'file' | 'function' | 'empty', public filePath: string, public startLine: number, public funcMatch?: FunctionMatch, public functionCount: number = 0 ) {}
 }
 
 function initPerformanceLogger(){
@@ -408,11 +398,15 @@ function createFileWatcher(context: vscode.ExtensionContext) {
 
 function removeRescan(uri: vscode.Uri){
 	const timer = rescanTimers.get(uri.fsPath);
+	clearRescanTimer(timer, uri);
+	invalidateFileCache(uri.fsPath);
+};
+
+function clearRescanTimer(timer: NodeJS.Timeout | undefined, uri: vscode.Uri) {
 	if (timer) {
 		clearTimeout(timer);
 		rescanTimers.delete(uri.fsPath);
 	}
-	invalidateFileCache(uri.fsPath);
 };
 
 // This method is called when your extension is activated
