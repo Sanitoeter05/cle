@@ -162,27 +162,16 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 
 	private functionHasChildren(fn:FunctionMatch, element: FunctionNode): FunctionNode {
 		const hasChildren = fn.children && fn.children.length > 0;
-		return new FunctionNode(
-			`${fn.name} (${fn.lineCount} lines)`,
-			hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-			'function',
-			element.filePath,
-			fn.startLine,
-			fn
-		);
+		return new FunctionNode(`${fn.name} (${fn.lineCount} lines)`,hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,'function',element.filePath,fn.startLine,fn);
 	};
 
 	private checkChildrenFunctions(element: FunctionNode): FunctionNode[] {
-		// Function level - show nested functions (children)
 		if(!element.funcMatch?.children) {
 			return [];
 		}
 		const children = element.funcMatch.children;
-		const childNodes = children.map(child => {
-			return this.functionHasChildren(child, element);
-		});
-		return childNodes;
-	}
+		return (children.map(child => {return this.functionHasChildren(child, element);}));
+	};
 
 	getChildren(element?: FunctionNode): Thenable<FunctionNode[]> {
 		if (!element) {
@@ -205,42 +194,23 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	}
 
 	/**
-	 * Compare two Maps of function matches for equality
-	 * Returns true if maps have identical content (deep comparison)
-	 * Uses property-based comparison instead of JSON.stringify for performance
-	 */
-	private mapsEqual(map1: Map<string, FunctionMatch[]>, map2: Map<string, FunctionMatch[]>): boolean {
-		if (map1.size !== map2.size) {
-			return false;
-		}
-		
-		for (const [key, value1] of map1) {
-			const value2 = map2.get(key);
-			if (!value2 || !this.arraysEqual(value1, value2)) {
-				return false;
-			}
-		}
-		
-		return true;
-	}
-
-	/**
 	 * Compare two arrays of FunctionMatch objects for equality
 	 * Returns true if arrays have same length and all elements are equal
 	 */
 	private arraysEqual(arr1: FunctionMatch[], arr2: FunctionMatch[]): boolean {
-		if (arr1.length !== arr2.length) {
+		if (arr1.length !== arr2.length && !this.compareFunctionArrays(arr1, arr2)) {
 			return false;
 		}
-		
-		for (let i = 0; i < arr1.length; i++) {
-			if (!this.functionMatchEqual(arr1[i], arr2[i])) {
-				return false;
-			}
-		}
-		
 		return true;
 	}
+
+	private compareFunctionArrays(arr1: FunctionMatch[], arr2: FunctionMatch[]): boolean | void {
+		for (let i = 0; i < arr1.length; i++) {
+			if (this.functionMatchEqual(arr1[i], arr2[i])) {
+				return true;
+		  	}
+		}; 
+	};
 
 	/**
 	 * Compare two FunctionMatch objects for equality
@@ -778,18 +748,11 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true, preDiscovere
  * Prevents excessive rescanning during rapid edits
  */
 function scheduleFileScan(filePath: string): void {
-	// Clear existing timer for this file
 	const existingTimer = rescanTimers.get(filePath);
 	if (existingTimer) {
 		clearTimeout(existingTimer);
 	}
-
-	// Schedule rescan with debounce delay
-	const timer = setTimeout(async () => {
-		await rescanSingleFile(filePath);
-		rescanTimers.delete(filePath);
-	}, CONFIG.FILE_RESCAN_DEBOUNCE_MS);
-
+	const timer = setTimeout(async () => { await rescanSingleFile(filePath); rescanTimers.delete(filePath); }, CONFIG.FILE_RESCAN_DEBOUNCE_MS);
 	rescanTimers.set(filePath, timer);
 }
 
