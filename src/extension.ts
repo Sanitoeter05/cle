@@ -140,15 +140,7 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	private async checkFile(functions: FunctionMatch[], filePath: string, files: FunctionNode[]){
 		if (functions.length > 0) {
 			const count = functions.length;
-			files.push(new FunctionNode(
-				basename(filePath),
-				vscode.TreeItemCollapsibleState.Collapsed,
-				'file',
-				filePath,
-				0,
-				undefined,
-				count
-			));
+			files.push(new FunctionNode(basename(filePath),vscode.TreeItemCollapsibleState.Collapsed,'file',filePath,0,undefined,count));
 		};
 	};
 
@@ -173,25 +165,28 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 		return (children.map(child => {return this.functionHasChildren(child, element);}));
 	};
 
-	getChildren(element?: FunctionNode): Thenable<FunctionNode[]> {
+	public getChildren(element?: FunctionNode): Thenable<FunctionNode[]> {
 		if (!element) {
-			return (async () => {
-				let files = await this.filterChildrensForFunction();
-				
-				if (files.length === 0) {
-					files.push(new FunctionNode('👉 Run "Scan for Functions Longer Than 5 Lines" to begin', vscode.TreeItemCollapsibleState.None, 'empty', '', 0, undefined));
-				}
-				
-				return files;
-			})();
+			return this.emptyMessage();
 		} else if (element.type === 'file') {
 			return Promise.resolve(this.checkFiles(element));
 		} else if (element.type === 'function' && element.funcMatch?.children) {
 			return Promise.resolve(this.checkChildrenFunctions(element));
 		}
-
 		return Promise.resolve([]);
 	}
+
+	private async emptyMessage(){
+		let files = this.getDefaultMessage(await this.filterChildrensForFunction());						
+		return files;
+	}
+
+	private getDefaultMessage(files: FunctionNode[]): FunctionNode[] {
+		if (files.length === 0) {
+			files.push(new FunctionNode('👉 Run "Scan for Functions Longer Than 5 Lines" to begin', vscode.TreeItemCollapsibleState.None, 'empty', '', 0, undefined));
+		};
+		return files;
+	};
 
 	/**
 	 * Compare two arrays of FunctionMatch objects for equality
@@ -217,79 +212,109 @@ class FunctionTreeDataProvider implements vscode.TreeDataProvider<FunctionNode> 
 	 * Performs recursive comparison of children arrays
 	 */
 	private functionMatchEqual(fn1: FunctionMatch, fn2: FunctionMatch): boolean {
-		// Compare basic properties
-		if (fn1.name !== fn2.name ||
-			fn1.startLine !== fn2.startLine ||
-			fn1.endLine !== fn2.endLine ||
-			fn1.lineCount !== fn2.lineCount) {
+		if (this.comparePropertys(fn1, fn2)&& this.compeareArrayHasChildren(fn1, fn2) && (fn1.children && fn2.children)) {
+			return this.arraysEqual(fn1.children, fn2.children );
+		}
+		return false;
+	}
+
+	private comparePropertys(fn1: FunctionMatch, fn2: FunctionMatch): boolean {
+		if (fn1.name !== fn2.name || fn1.startLine !== fn2.startLine || fn1.endLine !== fn2.endLine || fn1.lineCount !== fn2.lineCount) {
 			return false;
 		}
+		return true;
+	};
 
-		// Compare children arrays
-		if (!fn1.children && !fn2.children) {
-			return true; // Both have no children
-		}
-		if (!fn1.children || !fn2.children) {
-			return false; // One has children, the other doesn't
-		}
-		return this.arraysEqual(fn1.children, fn2.children);
-	}
+	private compeareArrayHasChildren(fn1: FunctionMatch, fn2: FunctionMatch): boolean {
+		if ((!fn1.children && fn2.children) || (fn1.children && !fn2.children)) {
+			return false;
+		};
+		return true;
+	};
 
 	updateData(fileMap: Map<string, FunctionMatch[]>) {
-		// Optimization: Selective updates instead of deep comparison
-		// Only update files that differ, avoiding expensive O(n³) comparison
 		let changed = false;
+		changed = this.addFilesToMap(fileMap, changed);
+		changed = this.removeDeletedFilesFromMap(fileMap,changed);
+		this.fireIfChanged(changed);
+	};
 
-		// Update or add files that have functions
-		for (const [filePath, newFunctions] of fileMap) {
-			if (newFunctions.length > 0) {
-				const oldFunctions = this.functionsData.get(filePath);
-				// Only update if this file is new or has different functions
-				if (!oldFunctions || !this.arraysEqual(oldFunctions, newFunctions)) {
-					this.functionsData.set(filePath, newFunctions);
-					changed = true;
-				}
-			}
-		}
-
-		// Remove files that are in the old data but not in the new fileMap
+	public removeDeletedFilesFromMap(fileMap: Map<string, FunctionMatch[]>, changed:boolean): boolean {
 		for (const filePath of this.functionsData.keys()) {
-			if (!fileMap.has(filePath) || fileMap.get(filePath)!.length === 0) {
-				this.functionsData.delete(filePath);
-				changed = true;
-			}
+			changed = this.DeleteFileWhenPersistent(filePath,fileMap ,changed);
 		}
+		return changed;
+	};
 
-		// Only fire change event if actual changes occurred
-		if (changed) {
-			this._onDidChangeTreeData.fire();
+	private DeleteFileWhenPersistent(filePath: string, fileMap: Map<string, FunctionMatch[]>, changed:boolean): boolean {
+		if (!fileMap.has(filePath) || fileMap.get(filePath)!.length === 0) {
+			this.functionsData.delete(filePath);
+			changed = true;
 		}
+		return changed;
+	};
+
+	public addFilesToMap(fileMap: Map<string, FunctionMatch[]>, changed:boolean =false): boolean {
+		for (const [filePath, newFunctions] of fileMap) {
+			if (this.updateProcess(newFunctions, filePath)) {changed = true;}
+		}
+		return changed;
+	};
+
+	private updateProcess(newFunctions: FunctionMatch[], filePath: string): boolean{
+		if (newFunctions.length > 0) {
+			const oldFunctions = this.functionsData.get(filePath);
+			return this.updateIfChanged(oldFunctions, newFunctions, filePath);
+		}
+		return false;
+	};
+
+	private updateIfChanged(oldFunctions: FunctionMatch[] | undefined, newFunctions: FunctionMatch[], filePath: string): boolean {
+		if (!oldFunctions || !this.arraysEqual(oldFunctions, newFunctions)) {
+			this.functionsData.set(filePath, newFunctions);
+			return true;
+		}
+		return false;
+	};
+
+	public updateSingleFile(filePath: string, functions: FunctionMatch[]) {
+		let hasChanged = false;
+		const oldFunctions = this.functionsData.get(filePath);
+		hasChanged = this.updateContend(filePath, functions, oldFunctions);
+		this.fireIfChanged(hasChanged);
 	}
 
-	updateSingleFile(filePath: string, functions: FunctionMatch[]) {
-		const oldFunctions = this.functionsData.get(filePath);
-		let hasChanged = false;
-		
+	private updateContend(filePath: string, functions: FunctionMatch[],oldFunctions: FunctionMatch[] | undefined): boolean {
 		if (functions.length > 0) {
-			// Check if new data differs from old data
-			if (!oldFunctions || !this.arraysEqual(oldFunctions, functions)) {
-				this.functionsData.set(filePath, functions);
-				hasChanged = true;
-			}
+			return this.dataDifferesFromData(oldFunctions, functions, filePath);
 		} else {
-			// Check if we're removing an entry that existed
-			if (oldFunctions !== undefined) {
-				this.functionsData.delete(filePath);
-				hasChanged = true;
-			}
+			return this.checkIfEntryExisted(oldFunctions, filePath);
 		}
-		
-		// Only fire change event if something actually changed
+	};
+
+	private checkIfEntryExisted(oldFunctions: FunctionMatch[] | undefined, filePath: string): boolean {
+		if (oldFunctions !== undefined) {
+			this.functionsData.delete(filePath);
+			return true;
+		};
+		return false;
+	};
+
+	private dataDifferesFromData(oldFunctions: FunctionMatch[] | undefined, functions: FunctionMatch[], filePath: string){
+		if (!oldFunctions || !this.arraysEqual(oldFunctions, functions)) {
+			this.functionsData.set(filePath, functions);
+			return true;
+		}
+		return false;
+	};
+
+	private fireIfChanged(hasChanged: boolean): void {
 		if (hasChanged) {
 			this._onDidChangeTreeData.fire();
 		}
-	}
+	};
 }
+
 
 interface FunctionMatch {
 	name: string;
@@ -320,14 +345,16 @@ function initTreeView(context: vscode.ExtensionContext) {
 	context.subscriptions.push(treeView);
 };
 
+async function openFunctionCallback(filePath: string, startLine: number): Promise<void> {
+	const document = await vscode.workspace.openTextDocument(filePath);
+	const editor = await vscode.window.showTextDocument(document);
+	const range = new vscode.Range(startLine - 1, 0, startLine - 1, 0);
+	editor.selection = new vscode.Selection(range.start, range.start);
+	editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+}
+
 function registerOpenFunctionCommand(context: vscode.ExtensionContext) {
-	const openFunctionDisposable = vscode.commands.registerCommand('cle.openFunction', async (filePath: string, startLine: number) => {
-		const document = await vscode.workspace.openTextDocument(filePath);
-		const editor = await vscode.window.showTextDocument(document);
-		const range = new vscode.Range(startLine - 1, 0, startLine - 1, 0);
-		editor.selection = new vscode.Selection(range.start, range.start);
-		editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-	});
+	const openFunctionDisposable = vscode.commands.registerCommand('cle.openFunction', openFunctionCallback);
 	context.subscriptions.push(openFunctionDisposable);
 };
 
@@ -348,23 +375,18 @@ function createStatusBarItem(context: vscode.ExtensionContext) {
 
 
 function createFileWatcher(context: vscode.ExtensionContext) {
-	
 	fileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx}');
-	fileWatcher.onDidChange(async (uri) => {
-		scheduleFileScan(uri.fsPath);
-	});
-
-	fileWatcher.onDidCreate(async (uri) => {
-		scheduleFileScan(uri.fsPath);
-	});
-
-	fileWatcher.onDidDelete(async (uri) => {
-		removeRescan(uri);
-		functionTreeProvider.updateSingleFile(uri.fsPath, []);
-		updateStatusBar();
-	});
+	fileWatcher.onDidChange(async (uri) => {scheduleFileScan(uri.fsPath);});
+	fileWatcher.onDidCreate(async (uri) => {scheduleFileScan(uri.fsPath);});
+	fileWatcher.onDidDelete(deleteWatcherListener);
 	context.subscriptions.push(fileWatcher);
 };
+
+async function deleteWatcherListener (uri: vscode.Uri){
+	removeRescan(uri);
+	functionTreeProvider.updateSingleFile(uri.fsPath, []);
+	updateStatusBar();
+}
 
 function removeRescan(uri: vscode.Uri){
 	const timer = rescanTimers.get(uri.fsPath);
@@ -379,43 +401,54 @@ function clearRescanTimer(timer: NodeJS.Timeout | undefined, uri: vscode.Uri) {
 	}
 };
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
 export async function activate(context: vscode.ExtensionContext) {
+	intitialRegistry(context);
+	registerLogger(context);
+	await initialScan();
+}
 
-	logger = new Logger('Function Scanner');
-	const workspaceFolders = initPerformanceLogger();
+function intitialRegistry(context: vscode.ExtensionContext){
 	initTreeView(context);
 	registerOpenFunctionCommand(context);
 	RegisterScanCommand(context);
 	createStatusBarItem(context);
 	createFileWatcher(context);
+};
 
+function registerLogger(context: vscode.ExtensionContext){
+	logger = new Logger('Function Scanner');
 	context.subscriptions.push(logger);
+};
 
-	// Discover files once and use for both warmup and main scan to avoid duplicate discovery
+async function initialScan(){
+	const workspaceFolders = initPerformanceLogger();
 	if (workspaceFolders) {
-		try {
-			const documents = await getAllFiles(workspaceFolders[0]);
-			if (documents && documents.length > 0) {
-				// Pre-warm the language server with discovered files
-				await warmupLanguageServer(documents);
-				// Critical: Wait for VS Code's LS to fully initialize
-				// Without this, first batch hits uninitialized LS, returns 0 symbols, takes 250+ms each
-				// With this, LS is ready for parallel batch processing
-				await new Promise(resolve => setTimeout(resolve, CONFIG.LANGUAGE_SERVER_WARMUP_DELAY_MS));
-				// Initial scan on startup (non-blocking, LS is already warm, files already discovered)
-				runScanUsingNativeSymbols(false, documents);
-			} else {
-				// No files found, run scan without pre-discovery
-				runScanUsingNativeSymbols(false);
-			}
-		} catch (error) {
-			// If discovery fails, run scan normally
-			runScanUsingNativeSymbols(false);
-		}
+		tryUpdate(workspaceFolders);
 	}
-}
+};
+
+async function tryUpdate(workspaceFolders: readonly vscode.WorkspaceFolder[]) {
+	try {
+		const documents = await getAllFiles(workspaceFolders[0]);
+		await updateDocuments(documents);
+	} catch (error) {
+		runScanUsingNativeSymbols(false);
+	}
+};
+
+async function updateDocuments(documents: vscode.Uri[] | null) {
+	if (documents && documents.length > 0) {
+		await startScan(documents);
+	} else {
+		runScanUsingNativeSymbols(false);
+	}
+};
+
+async function startScan(documents: vscode.Uri[]) {
+	await warmupLanguageServer(documents);
+	await new Promise(resolve => setTimeout(resolve, CONFIG.LANGUAGE_SERVER_WARMUP_DELAY_MS));
+	runScanUsingNativeSymbols(false, documents);
+};
 
 async function getAllFiles(workspaceFolder: vscode.WorkspaceFolder): Promise<vscode.Uri[] | null> {
 	const documents = await vscode.workspace.findFiles(
@@ -438,22 +471,30 @@ function checkDocument(documents: vscode.Uri[]): vscode.Uri[] | null {
  */
 function sanitizeErrorForUI(error: unknown): string {
 	let message = error instanceof Error ? error.message : String(error);
-	
-	// Limit message length
+	message = limitLentgh(message);
+	message = redactPaths(message);
+	message = redactCreds(message);
+	return message;
+}
+
+function limitLentgh(message: string): string {
 	if (message.length > 200) {
 		message = message.slice(0, 200) + '...';
 	}
-	
-	// Redact file paths
+	return message;
+};
+
+function redactPaths(message: string): string {
 	message = message.replace(/\/home\/[\w\-]+/g, '~');
 	message = message.replace(/[A-Z]:\\Users\\[\w\-]+/g, '~');
-	
-	// Redact credentials
+	return message;
+};
+
+function redactCreds(message: string): string {
 	message = message.replace(/token['"\':\s=]+[^\s'"\']+/gi, 'token=[REDACTED]');
 	message = message.replace(/password['"\':\s=]+[^\s'"\']+/gi, 'password=[REDACTED]');
-	
 	return message;
-}
+};
 
 const testFilePatterns =[/test/i, /spec/i, /mock/i];
 
@@ -465,28 +506,40 @@ const testFilePatterns =[/test/i, /spec/i, /mock/i];
  * @returns true if path is safe and within workspace, false otherwise
  */
 function validateFilePath(filePath: string, workspaceFolder: vscode.Uri): boolean {
-	try {
-		const normalizedPath = normalize(filePath);
-		const workspacePath = normalize(workspaceFolder.fsPath);
-		
-		// Ensure file is within workspace
-		if (!normalizedPath.startsWith(workspacePath)) {
-			logger.warn(`Path outside workspace: ${filePath}`);
-			return false;
-		}
-		
-		// Reject paths with suspicious patterns
-		if (normalizedPath.includes('..') || normalizedPath.includes('.git')) {
-			logger.warn(`Suspicious path detected: ${filePath}`);
-			return false;
-		}
-		
-		return true;
-	} catch (error) {
-		logger.error(`Error validating path: ${filePath}`, toError(error));
+    const paths = preparePaths(filePath, workspaceFolder);
+    return isPathValid(paths);
+}
+
+function preparePaths(filePath: string, workspaceFolder: vscode.Uri) {
+    return {
+        normalized: normalize(filePath),
+        workspace: normalize(workspaceFolder.fsPath),
+        original: filePath
+    };
+}
+
+function isPathValid(paths: ReturnType<typeof preparePaths>): boolean {
+    if (isSuspiciousPath(paths.normalized, paths.original)||isPathOutsideWorkspace(paths.normalized, paths.workspace, paths.original)) {
 		return false;
 	}
+    return true;
 }
+
+function isSuspiciousPath(normalizedPath: string, filePath: string): boolean {
+	if (normalizedPath.includes('..') || normalizedPath.includes('.git')) {
+		logger.warn(`Suspicious path detected: ${filePath}`);
+		return true;
+	}
+	return false;
+};
+
+function isPathOutsideWorkspace(normalizedPath: string, workspacePath: string, filePath: string): boolean {
+	if (!normalizedPath.startsWith(workspacePath)) {
+		logger.warn(`Path outside workspace: ${filePath}`);
+		return true;
+	}
+	return false;
+};
 
 /**
  * Pre-warm the language server by fetching symbols from multiple files
@@ -496,47 +549,48 @@ function validateFilePath(filePath: string, workspaceFolder: vscode.Uri): boolea
  */
 async function warmupLanguageServer(documents: vscode.Uri[]): Promise<void> {
 	try {
-		const sortedDocs = documents.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
-		const warmupFiles = findWarmupFiles(sortedDocs, CONFIG.MAX_WARMUP_FILES);
-		if (warmupFiles.length > 0) {
-			// Warmup in sequence (not parallel) - ensures LS gets properly initialized
-			for (const warmupFile of warmupFiles) {
-				await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-					'vscode.executeDocumentSymbolProvider',
-					warmupFile
-				);
-			}
-		}
+		warmUp(documents);
 	} catch (error) {
-		logger.warn(
-			`Language server warmup encountered an error: ${error instanceof Error ? error.message : String(error)}`
-		);
-		// Continue execution - warmup failure is not critical
+		logger.warn(`Language server warmup encountered an error: ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
+
+function warmUp(documents: vscode.Uri[]): void {
+	const sortedDocs = documents.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
+	const warmupFiles = findWarmupFiles(sortedDocs, CONFIG.MAX_WARMUP_FILES);
+	warmUpIfFound(warmupFiles);
+};
+
+function warmUpIfFound(warmupFiles: vscode.Uri[]): void {
+	if (warmupFiles.length > 0) {
+		fetchSymbolsForWarmupFile(warmupFiles);
+	}
+};
+
+async function fetchSymbolsForWarmupFile(warmupFiles: vscode.Uri[]): Promise<void> {
+	for (const warmupFile of warmupFiles) {
+		await vscode.commands.executeCommand<vscode.DocumentSymbol[]>('vscode.executeDocumentSymbolProvider',warmupFile);
+	}
+};
 
 /**
  * Find first N non-test files for warmup
  */
 function findWarmupFiles(sortedDocs: vscode.Uri[], count: number): vscode.Uri[] {
-	const warmupFiles: vscode.Uri[] = [];
-	for (const doc of sortedDocs) {
-		const filename = doc.fsPath.toLowerCase();
-		const isTestFile = testFilePatterns.some(pattern => pattern.test(filename));
-		if (!isTestFile) {
-			warmupFiles.push(doc);
-			if (warmupFiles.length >= count) {
-				break;
-			}
-		}
-	}
-	return warmupFiles;
+    return sortedDocs
+        .filter(doc => !isNonTestFile(doc))
+        .slice(0, count);
+}
+
+function isNonTestFile(doc: vscode.Uri): boolean {
+    const filename = doc.fsPath.toLowerCase();
+    return !testFilePatterns.some(pattern => pattern.test(filename));
 }
 
 /**
  * Process a single file to extract function symbols
  * Handles caching, symbol fetching, and flattening with error recovery
- * @param docUri - URI of the file to process
+ * @param docUri - URI of the file to processr
  * @returns Object with file path and extracted functions (or null on error)
  */
 async function processSingleFile(docUri: vscode.Uri): Promise<{ path: string; functions: FunctionMatch[] | null }> {
@@ -748,13 +802,21 @@ async function runScanUsingNativeSymbols(showPopup: boolean = true, preDiscovere
  * Prevents excessive rescanning during rapid edits
  */
 function scheduleFileScan(filePath: string): void {
+	clearTimer(filePath);
+	clearSingleRescanTimer(filePath);
+};
+
+function clearTimer(filePath: string){
 	const existingTimer = rescanTimers.get(filePath);
 	if (existingTimer) {
 		clearTimeout(existingTimer);
 	}
-	const timer = setTimeout(async () => { await rescanSingleFile(filePath); rescanTimers.delete(filePath); }, CONFIG.FILE_RESCAN_DEBOUNCE_MS);
+};
+
+function clearSingleRescanTimer(filePath: string) {
+	const timer = setTimeout(async () => {await rescanSingleFile(filePath);rescanTimers.delete(filePath);}, CONFIG.FILE_RESCAN_DEBOUNCE_MS);
 	rescanTimers.set(filePath, timer);
-}
+};
 
 /**
  * Rescan a single file and update the tree
