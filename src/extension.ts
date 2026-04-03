@@ -593,12 +593,7 @@ function isNonTestFile(doc: vscode.Uri): boolean {
  */
 async function processSingleFile(docUri: vscode.Uri): Promise<{ path: string; functions: FunctionMatch[] | null }> {
 	try {
-		// Validate file path for security
-		const workspaceFolders = vscode.workspace.workspaceFolders;
-		if (!workspaceFolders || !validateFilePath(docUri.fsPath, workspaceFolders[0].uri)) {
-			logger.error(`Invalid or unsafe file path: ${docUri.fsPath}`);
-			return { path: docUri.fsPath, functions: null };
-		}
+		if(!validateFilePathForSingleScan(docUri)){return { path: docUri.fsPath, functions: null };}
 
 		// Check memory cache first - validate against file modification time
 		// Optimization: Reuse stats object to avoid duplicate statSync() calls
@@ -677,6 +672,15 @@ async function processSingleFile(docUri: vscode.Uri): Promise<{ path: string; fu
 		return { path: docUri.fsPath, functions: null };
 	}
 }
+
+function validateFilePathForSingleScan(docUri: vscode.Uri):boolean{
+	const workspaceFolders = vscode.workspace.workspaceFolders;
+	if (!workspaceFolders || !validateFilePath(docUri.fsPath, workspaceFolders[0].uri)) {
+		logger.error(`Invalid or unsafe file path: ${docUri.fsPath}`);
+		return false;
+	}
+	return true;
+};
 
 /**
  * Scan using VS Code's native symbol API (more accurate than custom parser)
@@ -838,7 +842,8 @@ async function scanProcsses(filePath: string): Promise<void> {
 async function scaning(filePath: string, symbols: vscode.DocumentSymbol[]): Promise<void> {
 	invalidateFileCache(filePath);
 	updateTreeForEmptySymbols(filePath, symbols);
-	await cacheResult(filePath, symbols);
+	const result = await flattenSymbolsAsync(symbols, filePath);
+	cacheResult(result, filePath);
 	updateStatusBar();
 };
 
@@ -864,8 +869,7 @@ function updateTreeForEmptySymbols(filePath: string, symbols: vscode.DocumentSym
 	}
 };
 
-async function cacheResult(filePath: string, symbols: vscode.DocumentSymbol[]): Promise<void> {
-	const result = await flattenSymbolsAsync(symbols, filePath);
+function cacheResult(result: { functions: FunctionMatch[]; elapsed: number; stats: any }, filePath: string, ): void {
 	if (result.functions.length > 0) {
 		tryCaching(filePath, result);
 		functionTreeProvider.updateSingleFile(filePath, result.functions);
@@ -892,117 +896,82 @@ const FUNCTION_LIKE_KINDS = new Set([
  * Flatten nested DocumentSymbols using async/await with Promise-based recursion (Option 2)
  * Truly non-blocking with batched processing and yields between batches
  */
-async function flattenSymbolsAsync(
-	symbols: vscode.DocumentSymbol[],
-	filePath: string,
-	threshold: number = CONFIG.FUNCTION_LINE_THRESHOLD
-): Promise<{ functions: FunctionMatch[]; elapsed: number; stats: any }> {
+async function flattenSymbolsAsync(symbols: vscode.DocumentSymbol[], filePath: string, threshold: number = CONFIG.FUNCTION_LINE_THRESHOLD, processedSymbols:number = 0,createdFunctions:number = 0, functions: FunctionMatch[] = []): Promise<{ functions: FunctionMatch[]; elapsed: number; stats: any }> {
 	const overallStart = performance.now();
 	const startMemory = process.memoryUsage().heapUsed;
-	let processedSymbols = 0;
-	let createdFunctions = 0;
 	const BATCH_SIZE = CONFIG.SYMBOL_PROCESSING_BATCH_SIZE; // Process symbols per batch, then yield
+	return await tryFlattenSymbols(processedSymbols, createdFunctions, functions, symbols, threshold, BATCH_SIZE, overallStart, startMemory, filePath);
+}
 
-	const functions: FunctionMatch[] = [];
+async function tryFlattenSymbols(processedSymbols:number, createdFunctions:number, functions: FunctionMatch[], symbols: vscode.DocumentSymbol[], threshold: number, BATCH_SIZE: number, overallStart: number, startMemory: number, filePath: string): Promise<{ functions: FunctionMatch[]; elapsed: number; stats: any }> {
+	try {return await getFunctionSymbols(overallStart, startMemory, processedSymbols, createdFunctions, functions, symbols, threshold, BATCH_SIZE, filePath);} 
+	catch (error) {
+		logger.error(`Async processing failed for ${basename(filePath)}`,toError(error));
+		return {functions: [],elapsed: performance.now() - overallStart,stats: {processedSymbols: 0,createdFunctions: 0,elapsed: 0,memory: 0,},};
+	}
+};
 
-	// Async recursive function that batches symbols and yields between batches
-	async function processSymbolsAsync(
-		syms: vscode.DocumentSymbol[],
-		parent?: FunctionMatch
-	): Promise<void> {
-		for (let i = 0; i < syms.length; i++) {
-			const sym = syms[i];
-			processedSymbols++;
+async function getFunctionSymbols(overallStart: number, startMemory: number, processedSymbols:number, createdFunctions:number, functions: FunctionMatch[], symbols: vscode.DocumentSymbol[], threshold: number, BATCH_SIZE: number, filePath: string): Promise<{ functions: FunctionMatch[]; elapsed: number; stats: any }> {
+	({ processedSymbols, createdFunctions, functions } = await processSymbolsAsync(symbols, processedSymbols, createdFunctions, threshold, BATCH_SIZE, functions));
+	const overallElapsed = performance.now() - overallStart;
+	const memoryDelta =(process.memoryUsage().heapUsed - startMemory) / 1024; // KB delta
+	logger.info(`[flattenSymbolsAsync] File: ${basename(filePath)} | ` +`Processed: ${processedSymbols} symbols | ` +`Created: ${createdFunctions} functions | ` +`Time: ${overallElapsed.toFixed(2)}ms | ` +`Memory: ${memoryDelta > 0 ? '+' : ''}${memoryDelta.toFixed(2)}KB`);
+	return {functions,elapsed: overallElapsed,stats: {processedSymbols,createdFunctions,elapsed: overallElapsed,memory: memoryDelta,},};
+};
 
-			// Count only function-like symbols
-			if (FUNCTION_LIKE_KINDS.has(sym.kind)) {
-				const lineCount =
-					(sym.range.end.line) - (sym.range.start.line + 1);
+// Async recursive function that batches symbols and yields between batches
+async function processSymbolsAsync(syms: vscode.DocumentSymbol[], processedSymbols: number, createdFunctions: number,threshold: number , BATCH_SIZE: number, functions: FunctionMatch[], parent?: FunctionMatch): Promise<{ processedSymbols: number; createdFunctions: number; functions: FunctionMatch[] }> {
+	for (let i = 0; i < syms.length; i++) {
+		const sym = syms[i];
+		processedSymbols++;
 
-				if (lineCount > threshold) {
-					const func: FunctionMatch = {
-						name: sym.name,
-						startLine: sym.range.start.line + 1,
-						endLine: sym.range.end.line - 1,
-						lineCount,
-						metrics: { parser: 'vscode-symbols-async' },
-						children: [],
-					};
+		// Count only function-like symbols
+		if (FUNCTION_LIKE_KINDS.has(sym.kind)) {
+			const lineCount =
+				(sym.range.end.line) - (sym.range.start.line + 1);
 
-					createdFunctions++;
+			if (lineCount > threshold) {
+				const func: FunctionMatch = {
+					name: sym.name,
+					startLine: sym.range.start.line + 1,
+					endLine: sym.range.end.line - 1,
+					lineCount,
+					metrics: { parser: 'vscode-symbols-async' },
+					children: [],
+				};
 
-					if (parent) {
-						// Add as child of parent function
-						if (!parent.children) {
-							parent.children = [];
-						}
-						parent.children.push(func);
-					} else {
-						// Top-level function
-						functions.push(func);
+				createdFunctions++;
+
+				if (parent) {
+					// Add as child of parent function
+					if (!parent.children) {
+						parent.children = [];
 					}
+					parent.children.push(func);
+				} else {
+					// Top-level function
+					functions.push(func);
+				}
 
-					// Process children (nested functions)
-					if (sym.children) {
-						await processSymbolsAsync(sym.children, func);
-					}
-				} else if (sym.children) {
-					// Still check children even if parent is below threshold
-					await processSymbolsAsync(sym.children, parent);
+				// Process children (nested functions)
+				if (sym.children) {
+					({ processedSymbols, createdFunctions, functions } = await processSymbolsAsync(sym.children, processedSymbols, createdFunctions, threshold, BATCH_SIZE, functions, func));
 				}
 			} else if (sym.children) {
-				// For non-function symbols (classes, interfaces), check their children
-				await processSymbolsAsync(sym.children, parent);
+					// Still check children even if parent is below threshold
+				({ processedSymbols, createdFunctions, functions } = await processSymbolsAsync(sym.children, processedSymbols, createdFunctions, threshold, BATCH_SIZE, functions, parent));
 			}
+		} else if (sym.children) {
+			// For non-function symbols (classes, interfaces), check their children
+			({ processedSymbols, createdFunctions, functions } = await processSymbolsAsync(sym.children, processedSymbols, createdFunctions, threshold, BATCH_SIZE, functions, parent));
+		}
 
-			// Yield after every BATCH_SIZE symbols to break up the work
-			if ((i + 1) % BATCH_SIZE === 0) {
-				await new Promise((resolve) => setImmediate(resolve));
-			}
+		// Yield after every BATCH_SIZE symbols to break up the work
+		if ((i + 1) % BATCH_SIZE === 0) {
+			await new Promise((resolve) => setImmediate(resolve));
 		}
 	}
-
-	try {
-		await processSymbolsAsync(symbols);
-
-		const overallElapsed = performance.now() - overallStart;
-		const memoryDelta =
-			(process.memoryUsage().heapUsed - startMemory) / 1024; // KB
-
-		logger.info(
-			`[flattenSymbolsAsync] File: ${basename(filePath)} | ` +
-			`Processed: ${processedSymbols} symbols | ` +
-			`Created: ${createdFunctions} functions | ` +
-			`Time: ${overallElapsed.toFixed(2)}ms | ` +
-			`Memory: ${memoryDelta > 0 ? '+' : ''}${memoryDelta.toFixed(2)}KB`
-		);
-
-		return {
-			functions,
-			elapsed: overallElapsed,
-			stats: {
-				processedSymbols,
-				createdFunctions,
-				elapsed: overallElapsed,
-				memory: memoryDelta,
-			},
-		};
-	} catch (error) {
-		logger.error(
-			`Async processing failed for ${basename(filePath)}`,
-			toError(error)
-		);
-		return {
-			functions: [],
-			elapsed: performance.now() - overallStart,
-			stats: {
-				processedSymbols: 0,
-				createdFunctions: 0,
-				elapsed: 0,
-				memory: 0,
-			},
-		};
-	}
+	return { processedSymbols, createdFunctions, functions};
 }
 
 function updateStatusBar(): void {
